@@ -33,6 +33,12 @@ pub enum BlockDeviceError {
         source: anyhow::Error,
     },
 
+    #[error("sourceType=auto requires an explicit key URI")]
+    AutoSourceRequiresKey,
+
+    #[error("sourceType=auto is supported only with LUKS2 encryption")]
+    AutoSourceRequiresLuks2,
+
     #[error("Error when doing luks2 operation: {source}")]
     Luks2Error {
         #[source]

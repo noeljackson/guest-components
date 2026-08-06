@@ -33,9 +33,9 @@ Common fields used by **both** LUKS2 and ZFS modes:
 | `volume_type`     | top-level   | `"block-device"`                                  | Yes      | Selects the block-device plugin. Must be `"block-device"` for this guide. |
 | `options.devicePath`      | `options`   | String path (e.g. `/dev/loop0`)                   | One of `devicePath` or `deviceId` | Path to the backing block device. If both `devicePath` and `deviceId` are set, `deviceId` wins. |
 | `options.deviceId`        | `options`   | String `"MAJ:MIN"` (e.g. `"7:0"`)                 | One of `devicePath` or `deviceId` | Kernel major/minor device ID. CDH resolves it to a device path internally. |
-| `options.sourceType`      | `options`   | `"empty"` \| `"encrypted"`                        | Yes      | `"empty"` means the device will be initialized and encrypted; `"encrypted"` means the device is already encrypted and should be opened. |
+| `options.sourceType`      | `options`   | `"empty"` \| `"encrypted"` \| `"auto"`             | Yes      | `"empty"` initializes legacy ephemeral storage, `"encrypted"` opens known encrypted media, and LUKS2-only `"auto"` safely initializes or reopens persistent ext4 storage. |
 | `options.encryptionType`  | `options`   | `"luks2"` \| `"zfs"`                              | Yes      | Selects the encryption mode. LUKS2 uses dm-crypt; ZFS uses ZFS native encryption. |
-| `options.key`             | `options`   | URI: `sealed.*`, `kbs://…`, or `file://…`         | No       | Where to fetch the encryption key. If omitted, CDH generates a random key (ephemeral storage). |
+| `options.key`             | `options`   | URI: `sealed.*`, `kbs://…`, or `file://…`         | No       | Where to fetch the encryption key. It is required for `sourceType: "auto"`; other source types retain the existing random-key behavior when omitted. |
 | `mount_point`     | top-level   | String path (e.g. `/mnt/my-path`)                 | Yes      | Path inside the guest where the cleartext device or filesystem becomes visible. |
 
 ### LUKS2-specific options
@@ -49,6 +49,15 @@ In addition to the common fields above, LUKS2 mode understands the following opt
 | `options.mkfsOpts`         | String of extra args to `mkfs.<fs>`          | No       | Use only when `sourceType` is `"empty"` and you need to tune filesystem creation (e.g. `"-E lazy_journal_init=1"`). Leave empty for sane defaults. |
 | `options.dataIntegrity`    | Boolean (`true` / `false`)                   | No (default `false`) | Enable (`true`) to turn on dm-integrity for stronger integrity guarantees; expect >30% IO performance overhead. Keep `false` for performance‑sensitive ephemeral storage. |
 | `options.mapperName`       | String (e.g. `"my-mapped-device"`)           | No       | Set when you need a stable `/dev/mapper/<name>` for monitoring or debugging. When omitted, CDH generates a UUID-based name. |
+| `options.grow`             | String `"true"` / `"false"`                 | No (default `"false"`) | After reopening and mounting ext4, run idempotent online `resize2fs` so the filesystem consumes an enlarged device. |
+
+For persistent direct volumes, use `sourceType: "auto"`, LUKS2,
+`targetType: "fileSystem"`, ext4, and an explicit key URI. CDH first recognizes
+a valid on-device LUKS2 header. It initializes a new on-device LUKS2 volume only
+when the complete bounded initialization probe region is zero. A corrupt LUKS
+header, unknown non-zero media, missing or wrong key, or non-ext4 decrypted
+filesystem fails without formatting the device. `auto` is rejected for ZFS and
+cleartext device targets.
 
 When `encryptionType` is `"luks2"`, `targetType` is `"fileSystem"`,
 `filesystemType` is `"ext4"`, and `dataIntegrity` is `true`, CDH formats ext4
@@ -158,6 +167,31 @@ Ephemeral storage is a storage that is not persistent.
 ```
 
 #### Case 2: Persistent Storage with LUKS2
+
+For a CDH-managed persistent volume that may be blank on its first mount, use
+the safe auto-detection contract:
+
+```json
+{
+    "volume_type": "block-device",
+    "options": {
+        "devicePath": "/dev/loop0",
+        "sourceType": "auto",
+        "targetType": "fileSystem",
+        "encryptionType": "luks2",
+        "key": "kbs:///default/example-luks/workspace-id",
+        "filesystemType": "ext4",
+        "grow": "true"
+    },
+    "flags": [],
+    "mount_point": "/mnt/directory-path"
+}
+```
+
+The first request initializes only a completely zero-probed device. Later
+requests reopen the existing LUKS2 volume. If the backing device was enlarged,
+`grow: "true"` grows ext4 online after the mount; an already full-size
+filesystem is unchanged.
 
 1. Mount a `luks2` encrypted block device file and return the plaintext device path, mounting the plaintext to `/mnt/dev-path` as a device file. The decryption key can either be obtained from KBS, or from local filesystem.
 

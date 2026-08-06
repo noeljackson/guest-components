@@ -11,9 +11,14 @@
 //! It requires the `cryptsetup` CLI to be installed (e.g. `cryptsetup-bin` on Debian/Ubuntu).
 //! No libcryptsetup-rs is linked, so the hub binary can be built as fully static.
 
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    process::{Command, Stdio},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64, Engine};
 use const_format::concatcp;
 use nix::mount::{mount, MsFlags};
@@ -33,6 +38,10 @@ const HMAC_SHA256: &str = "hmac-sha256";
 const SECTOR_SIZE: u32 = 4096;
 
 const CRYPTSETUP_BIN: &str = "cryptsetup";
+
+const AUTO_INITIALIZATION_PROBE_BYTES: usize = 4 * 1024 * 1024;
+const EXT4_SUPERBLOCK_MAGIC_OFFSET: u64 = 1024 + 56;
+const EXT4_SUPERBLOCK_MAGIC: [u8; 2] = [0x53, 0xef];
 
 pub const LUKS_HEADERS_STORAGE_DIR: &str = concatcp!(CDH_BASE_DIR, "/luks-headers");
 pub const LUKS_HEADER_FILE_SUFFIX: &str = ".header";
@@ -167,11 +176,57 @@ impl Luks2Formatter {
         run_cryptsetup(&args).context("cryptsetup luksClose failed")?;
         Ok(())
     }
+
+    /// Resolve a persistent direct-volume source without ever guessing that
+    /// non-zero media is safe to initialize.
+    pub fn resolve_auto_source(&self, device_path: &str) -> anyhow::Result<SourceType> {
+        let probe_is_zeroed = initialization_probe_is_zeroed(device_path)?;
+        let status = Command::new(CRYPTSETUP_BIN)
+            .args(["isLuks", "--type", "luks2", device_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("failed to probe LUKS2 device")?;
+
+        if status.success() {
+            return Ok(SourceType::Encrypted);
+        }
+
+        if probe_is_zeroed {
+            return Ok(SourceType::Empty);
+        }
+
+        bail!(
+            "auto source refused: device is not valid LUKS2 and its initialization probe region is not completely zeroed"
+        )
+    }
+}
+
+fn initialization_probe_is_zeroed(device_path: &str) -> anyhow::Result<bool> {
+    let mut device = File::open(device_path).context("failed to open auto source device")?;
+    let mut probe = vec![0u8; AUTO_INITIALIZATION_PROBE_BYTES];
+    device
+        .read_exact(&mut probe)
+        .context("auto source device is smaller than the initialization probe region")?;
+    Ok(probe.iter().all(|byte| *byte == 0))
+}
+
+fn has_ext4_superblock(device_path: &str) -> anyhow::Result<bool> {
+    let mut device = File::open(device_path).context("failed to open decrypted device")?;
+    device
+        .seek(SeekFrom::Start(EXT4_SUPERBLOCK_MAGIC_OFFSET))
+        .context("failed to seek to ext4 superblock")?;
+    let mut magic = [0u8; EXT4_SUPERBLOCK_MAGIC.len()];
+    device
+        .read_exact(&mut magic)
+        .context("failed to read ext4 superblock")?;
+    Ok(magic == EXT4_SUPERBLOCK_MAGIC)
 }
 
 /// Run cryptsetup with passphrase on stdin. Does not append newline.
 fn run_cryptsetup_stdin(args: &[&str], passphrase: &[u8]) -> anyhow::Result<()> {
-    let inputs = passphrase.to_vec();
+    let inputs = Zeroizing::new(passphrase.to_vec());
     let _ = run_command(CRYPTSETUP_BIN, args, Some(inputs))
         .context("failed to run cryptsetup with stdin")?;
     Ok(())
@@ -199,11 +254,30 @@ pub struct Luks2MountParameters {
     #[serde(rename = "mapperName")]
     pub mapper_name: Option<String>,
 
+    /// Grow the mounted ext4 filesystem to the current device size. The value
+    /// is represented as a string because secure-mount options are a string
+    /// map at the CDH boundary.
+    #[serde(default)]
+    pub grow: Option<String>,
+
     /// The type of the target mount point.
     /// Either `device` or `fileSystem`.
     #[serde(rename = "targetType")]
     #[serde(flatten)]
     pub target_type: TargetType,
+}
+
+pub struct Luks2MountOutcome {
+    pub header_path: Option<String>,
+    pub mapper_name: String,
+}
+
+fn parse_grow(value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => bail!("grow must be `true` or `false`"),
+    }
 }
 
 impl Luks2MountParameters {
@@ -215,20 +289,43 @@ impl Luks2MountParameters {
         mount_point: &str,
         key: Zeroizing<Vec<u8>>,
         source_type: SourceType,
-    ) -> Result<Option<String>> {
+    ) -> Result<Luks2MountOutcome> {
         let data_integrity = self.data_integrity.map(|s| s == "true").unwrap_or(false);
+        let grow = parse_grow(self.grow.as_deref())?;
         let formatter = Luks2Formatter::default().with_integrity(data_integrity);
-        // 3.1 if the source type is empty, encrypt the device and create detached header
-        let header_path = if source_type == SourceType::Empty {
-            warn!("encrypting the device. This will wipe original data on the disk.");
-            let header_path = luks_header_path(device_path);
-            prepare_luks_header_file(&header_path)?;
-            formatter
-                .encrypt_device(device_path, Some(&header_path), key.clone())
-                .context("Failed to encrypt LUKS2 device")?;
-            Some(header_path)
+        let auto = source_type == SourceType::Auto;
+
+        if auto && self.target_type == TargetType::Device {
+            bail!("sourceType=auto requires an ext4 filesystem target");
+        }
+
+        let resolved_source = if auto {
+            formatter.resolve_auto_source(device_path)?
         } else {
-            None
+            source_type
+        };
+
+        // Preserve the legacy detached-header behavior for explicit `empty`.
+        // Persistent `auto` volumes always use an on-device LUKS2 header so the
+        // volume can be reopened by a replacement guest.
+        let header_path = match (source_type, resolved_source) {
+            (SourceType::Empty, _) => {
+                warn!("encrypting an explicitly empty device");
+                let header_path = luks_header_path(device_path);
+                prepare_luks_header_file(&header_path)?;
+                formatter
+                    .encrypt_device(device_path, Some(&header_path), key.clone())
+                    .context("Failed to encrypt LUKS2 device")?;
+                Some(header_path)
+            }
+            (SourceType::Auto, SourceType::Empty) => {
+                info!("initializing a zero-probed device as LUKS2");
+                formatter
+                    .encrypt_device(device_path, None, key.clone())
+                    .context("Failed to initialize LUKS2 device")?;
+                None
+            }
+            _ => None,
         };
 
         let devmapper_name = self.mapper_name.unwrap_or_else(|| {
@@ -242,126 +339,227 @@ impl Luks2MountParameters {
             .context("Failed to open LUKS2 device")?;
 
         let dev_path = format!("/dev/mapper/{}", devmapper_name);
-        match (self.target_type, source_type) {
-            // 3.2 if the target type is device, do the symlink operation to map
-            // the device path to the mount point.
-            (TargetType::Device, _) => {
-                info!(
-                    "symlinking device: {} to mount point: {}",
-                    dev_path, mount_point
-                );
-                symlink(&dev_path, mount_point).await.with_context(|| {
-                    format!(
-                        "Failed to create symlink from {} to {}",
+        let mut mounted = false;
+        let mut symlink_created = false;
+        let setup_result: Result<()> = async {
+            match (self.target_type, resolved_source) {
+                // 3.2 if the target type is device, do the symlink operation to map
+                // the device path to the mount point.
+                (TargetType::Device, _) => {
+                    info!(
+                        "symlinking device: {} to mount point: {}",
                         dev_path, mount_point
-                    )
-                })?;
-                debug!(mount_point = mount_point, "created symlink");
-            }
-            // 3.3 if the source type is encrypted, meaning that there is
-            // already a filesystem on the device, so we just need to mount it to the mount point.
-            (
-                TargetType::FileSystem {
-                    filesystem_type, ..
-                },
-                SourceType::Encrypted,
-            ) => {
-                info!(
-                    "mounting device: {} to mount point: {}",
-                    dev_path, mount_point
-                );
-                mount::<_, _, str, _>(
-                    Some(&dev_path[..]),
-                    mount_point,
-                    Some(filesystem_type.as_ref()),
-                    MsFlags::MS_NOATIME,
-                    Some(""),
-                )
-                .with_context(|| {
-                    format!(
-                        "Failed to mount device {} to mount point {}",
+                    );
+                    symlink(&dev_path, mount_point).await.with_context(|| {
+                        format!(
+                            "Failed to create symlink from {} to {}",
+                            dev_path, mount_point
+                        )
+                    })?;
+                    symlink_created = true;
+                    debug!(mount_point = mount_point, "created symlink");
+                }
+                // 3.3 an encrypted source already has a filesystem.
+                (
+                    TargetType::FileSystem {
+                        filesystem_type, ..
+                    },
+                    SourceType::Encrypted,
+                ) => {
+                    if auto && !has_ext4_superblock(&dev_path)? {
+                        bail!("auto source refused: decrypted filesystem is not ext4");
+                    }
+                    info!(
+                        "mounting device: {} to mount point: {}",
                         dev_path, mount_point
+                    );
+                    mount::<_, _, str, _>(
+                        Some(&dev_path[..]),
+                        mount_point,
+                        Some(filesystem_type.as_ref()),
+                        MsFlags::MS_NOATIME,
+                        Some(""),
                     )
-                })?;
+                    .with_context(|| {
+                        format!(
+                            "Failed to mount device {} to mount point {}",
+                            dev_path, mount_point
+                        )
+                    })?;
+                    mounted = true;
 
-                debug!(mount_point = mount_point, "mounted device");
-            }
-            // 3.4 if the source type is empty, meaning that we should also make
-            // a filesystem on the device.
-            (
-                TargetType::FileSystem {
-                    filesystem_type,
-                    mkfs_opts,
-                },
-                SourceType::Empty,
-            ) => {
-                info!(
-                    "formatting device: {} and mounting it to mount point: {}",
-                    dev_path, mount_point
-                );
-                let args = mkfs_opts
-                    .map(|s| {
-                        s.split_ascii_whitespace()
-                            .map(|x| x.to_string())
-                            .collect::<Vec<String>>()
-                    })
-                    .unwrap_or_default();
-                debug!(
-                    device_path = dev_path,
-                    filesystem_type = ?filesystem_type,
-                    args = ?args,
-                    "formatting device"
-                );
-                let fs_formatter = FsFormatter {
-                    fs_type: filesystem_type,
-                    force: true,
-                    args,
-                };
-
-                let format_result = if data_integrity {
-                    fs_formatter.format_integrity_compatible(&dev_path)
-                } else {
-                    fs_formatter.format(&dev_path)
-                };
-                format_result.with_context(|| {
-                    format!(
-                        "Failed to make filesystem {:?} of device {}",
-                        filesystem_type, dev_path
-                    )
-                })?;
-
-                debug!(device_path = dev_path, "mounting device");
-                mount(
-                    Some(&dev_path[..]),
-                    mount_point,
-                    Some(filesystem_type.as_ref()),
-                    MsFlags::MS_NOATIME,
-                    Some(""),
-                )
-                .with_context(|| {
-                    format!(
-                        "Failed to mount device {} to mount point {}",
+                    if grow {
+                        FsFormatter {
+                            fs_type: filesystem_type,
+                            force: false,
+                            args: Vec::new(),
+                        }
+                        .grow_online(&dev_path)
+                        .context("Failed to grow mounted ext4 filesystem")?;
+                    }
+                    debug!(mount_point = mount_point, "mounted device");
+                }
+                // 3.4 an empty source must be formatted before it is mounted.
+                (
+                    TargetType::FileSystem {
+                        filesystem_type,
+                        mkfs_opts,
+                    },
+                    SourceType::Empty,
+                ) => {
+                    info!(
+                        "formatting device: {} and mounting it to mount point: {}",
                         dev_path, mount_point
+                    );
+                    let args = mkfs_opts
+                        .map(|s| {
+                            s.split_ascii_whitespace()
+                                .map(|x| x.to_string())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default();
+                    debug!(
+                        device_path = dev_path,
+                        filesystem_type = ?filesystem_type,
+                        args = ?args,
+                        "formatting device"
+                    );
+                    let fs_formatter = FsFormatter {
+                        fs_type: filesystem_type,
+                        force: true,
+                        args,
+                    };
+
+                    let format_result = if data_integrity {
+                        fs_formatter.format_integrity_compatible(&dev_path)
+                    } else {
+                        fs_formatter.format(&dev_path)
+                    };
+                    format_result.with_context(|| {
+                        format!(
+                            "Failed to make filesystem {:?} of device {}",
+                            filesystem_type, dev_path
+                        )
+                    })?;
+                    if auto && !has_ext4_superblock(&dev_path)? {
+                        bail!("initialized filesystem is not ext4");
+                    }
+
+                    debug!(device_path = dev_path, "mounting device");
+                    mount(
+                        Some(&dev_path[..]),
+                        mount_point,
+                        Some(filesystem_type.as_ref()),
+                        MsFlags::MS_NOATIME,
+                        Some(""),
                     )
-                })?;
-                debug!(mount_point = mount_point, "mounted device");
+                    .with_context(|| {
+                        format!(
+                            "Failed to mount device {} to mount point {}",
+                            dev_path, mount_point
+                        )
+                    })?;
+                    mounted = true;
+                    if grow {
+                        fs_formatter
+                            .grow_online(&dev_path)
+                            .context("Failed to grow mounted ext4 filesystem")?;
+                    }
+                    debug!(mount_point = mount_point, "mounted device");
+                }
+                (_, SourceType::Auto) => unreachable!("auto source must be resolved before setup"),
             }
+            Ok(())
         }
-        Ok(header_path)
+        .await;
+
+        if let Err(source) = setup_result {
+            if mounted {
+                let _ = nix::mount::umount(mount_point);
+            }
+            if symlink_created {
+                let _ = tokio::fs::remove_file(mount_point).await;
+            }
+            if let Err(close_error) = formatter.close_device(&devmapper_name) {
+                warn!(error = %close_error, "failed to close LUKS2 mapping after setup error");
+            }
+            return Err(source);
+        }
+
+        Ok(Luks2MountOutcome {
+            header_path,
+            mapper_name: devmapper_name,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     use serial_test::serial;
     use zeroize::Zeroizing;
 
-    use super::{luks_header_path, prepare_luks_header_file, Luks2Formatter};
+    use crate::storage::volume_type::blockdevice::SourceType;
+
+    use super::{
+        initialization_probe_is_zeroed, luks_header_path, prepare_luks_header_file,
+        run_cryptsetup_stdin, Luks2Formatter, AUTO_INITIALIZATION_PROBE_BYTES,
+    };
 
     const TEST_PASSPHRASE: &[u8] = b"test";
     const NAME: &str = "test";
+
+    #[test]
+    fn auto_probe_accepts_only_a_complete_zeroed_region() {
+        let mut zeroed = tempfile::NamedTempFile::new().unwrap();
+        zeroed
+            .as_file_mut()
+            .set_len(AUTO_INITIALIZATION_PROBE_BYTES as u64)
+            .unwrap();
+        assert!(initialization_probe_is_zeroed(zeroed.path().to_str().unwrap()).unwrap());
+
+        zeroed.as_file_mut().seek(SeekFrom::Start(4096)).unwrap();
+        zeroed.as_file_mut().write_all(&[1]).unwrap();
+        assert!(!initialization_probe_is_zeroed(zeroed.path().to_str().unwrap()).unwrap());
+
+        let too_small = tempfile::NamedTempFile::new().unwrap();
+        too_small.as_file().set_len(4096).unwrap();
+        assert!(initialization_probe_is_zeroed(too_small.path().to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn auto_source_resolves_zeroed_and_refuses_unknown_media() {
+        let mut device = tempfile::NamedTempFile::new().unwrap();
+        device
+            .as_file_mut()
+            .set_len(AUTO_INITIALIZATION_PROBE_BYTES as u64)
+            .unwrap();
+        let formatter = Luks2Formatter::default();
+        assert_eq!(
+            formatter
+                .resolve_auto_source(device.path().to_str().unwrap())
+                .unwrap(),
+            SourceType::Empty
+        );
+
+        device.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        device.as_file_mut().write_all(b"unknown-media").unwrap();
+        assert!(formatter
+            .resolve_auto_source(device.path().to_str().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn cryptsetup_errors_never_include_the_passphrase() {
+        let canary = b"codewire-secret-canary-never-log";
+        let err = run_cryptsetup_stdin(
+            &["luksOpen", "-d", "-", "/definitely/missing", "missing"],
+            canary,
+        )
+        .unwrap_err();
+        assert!(!format!("{err:#}").contains(std::str::from_utf8(canary).unwrap()));
+    }
 
     /// Removes the LUKS header file on drop so tests don't leave files behind on panic.
     struct RemoveHeaderOnDrop(String);

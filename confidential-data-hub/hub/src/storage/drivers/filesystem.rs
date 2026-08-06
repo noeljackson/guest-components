@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::storage::drivers::run_command;
 
 const EXT4_COMMAND: &str = "mkfs.ext4";
+const RESIZE2FS_COMMAND: &str = "resize2fs";
 const DD_COMMAND: &str = "dd";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy, AsRefStr, Default)]
@@ -125,6 +126,21 @@ impl FsFormatter {
 
     pub fn format(&self, device_path: &str) -> Result<()> {
         self.format_with_args(device_path, &self.args)
+    }
+
+    /// Grow an ext4 filesystem to the current size of its backing device.
+    ///
+    /// `resize2fs` is idempotent when the filesystem already occupies the
+    /// complete device. Callers must mount the filesystem before invoking this
+    /// method so growth happens online.
+    pub fn grow_online(&self, device_path: &str) -> Result<()> {
+        match self.fs_type {
+            FsType::Ext4 => {
+                let _ = run_command(RESIZE2FS_COMMAND, &[device_path], None)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn format_with_args(&self, device_path: &str, format_args: &[String]) -> Result<()> {

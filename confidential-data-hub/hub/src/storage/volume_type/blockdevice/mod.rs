@@ -73,8 +73,13 @@ async fn get_plaintext_key(key_uri: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(key))
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Debug)]
 pub enum SourceType {
+    /// Detect an existing LUKS2 device, or initialize only when the bounded
+    /// initialization probe region is completely zeroed.
+    #[serde(rename = "auto")]
+    Auto,
+
     /// The source is an encrypted device.
     #[serde(rename = "encrypted")]
     Encrypted,
@@ -166,9 +171,10 @@ impl BlockDevice {
         };
 
         // 2. get key if the parameter is set
-        let key = match &parameters.key {
-            Some(key) => get_plaintext_key(key).await?,
-            None => {
+        let key = match (&parameters.key, parameters.source_type) {
+            (None, SourceType::Auto) => return Err(BlockDeviceError::AutoSourceRequiresKey),
+            (Some(key), _) => get_plaintext_key(key).await?,
+            (None, _) => {
                 debug!("generate a random key. All data on the device will be overwritten.");
                 Zeroizing::new(random_bytes::<4096>())
             }
@@ -177,19 +183,28 @@ impl BlockDevice {
         // 3. do the workflow according to the source type and target type according to different encryption types
         match parameters.encryption_type {
             BlockDeviceEncryptType::Luks2(luks2_parameters) => {
-                if luks2_parameters.target_type
-                    == crate::storage::drivers::luks2::TargetType::Device
-                {
+                let target_is_device = luks2_parameters.target_type
+                    == crate::storage::drivers::luks2::TargetType::Device;
+                let outcome = luks2_parameters
+                    .do_mount(&device_path, mount_point, key, parameters.source_type)
+                    .await
+                    .map_err(|source| BlockDeviceError::Luks2Error { source })?;
+
+                if target_is_device {
                     self.temp_paths.push(mount_point.to_string());
                 } else {
                     self.mount_points.push(mount_point.to_string());
                 }
-                luks2_parameters
-                    .do_mount(&device_path, mount_point, key, parameters.source_type)
-                    .await
-                    .map_err(|source| BlockDeviceError::Luks2Error { source })?;
+                if let Some(header_path) = outcome.header_path {
+                    self.temp_paths.push(header_path);
+                }
+                self.cryptsetup_pairs
+                    .push((device_path, outcome.mapper_name));
             }
             BlockDeviceEncryptType::Zfs(zfs_parameters) => {
+                if parameters.source_type == SourceType::Auto {
+                    return Err(BlockDeviceError::AutoSourceRequiresLuks2);
+                }
                 self.zfs_pools.push(zfs_parameters.pool.clone());
                 zfs_parameters
                     .do_mount(&device_path, mount_point, key, parameters.source_type)
@@ -230,6 +245,11 @@ impl BlockDevice {
         for pool in &self.zfs_pools {
             export_zpool(pool).map_err(|source| BlockDeviceError::ZfsError { source })?;
         }
+
+        self.mount_points.clear();
+        self.temp_paths.clear();
+        self.cryptsetup_pairs.clear();
+        self.zfs_pools.clear();
 
         Ok(())
     }
@@ -285,7 +305,11 @@ async fn get_device_path(major: u32, minor: u32) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
-    use std::path::Path;
+    use std::{
+        io::{Read, Seek, SeekFrom, Write},
+        path::Path,
+        process::Command,
+    };
     use tempfile::TempDir;
     use tracing::warn;
 
@@ -298,6 +322,47 @@ mod tests {
     use super::*;
 
     const EXT4_INTEGRITY_MKFS_OPTS: &str = "-O ^has_journal -m 0 -i 163840 -I 128";
+    const AUTO_PROBE_BYTES: usize = 4 * 1024 * 1024;
+
+    fn auto_filesystem_options(
+        device_path: &str,
+        key_path: &str,
+        mapper_name: &str,
+        grow: bool,
+    ) -> HashMap<String, String> {
+        HashMap::from([
+            ("sourceType".to_string(), "auto".to_string()),
+            ("targetType".to_string(), "fileSystem".to_string()),
+            ("devicePath".to_string(), device_path.to_string()),
+            ("encryptionType".to_string(), "luks2".to_string()),
+            ("key".to_string(), format!("file://{key_path}")),
+            ("mapperName".to_string(), mapper_name.to_string()),
+            ("dataIntegrity".to_string(), "false".to_string()),
+            ("filesystemType".to_string(), "ext4".to_string()),
+            ("grow".to_string(), grow.to_string()),
+        ])
+    }
+
+    fn read_auto_probe(path: &Path) -> Vec<u8> {
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut probe = vec![0u8; AUTO_PROBE_BYTES];
+        file.read_exact(&mut probe).unwrap();
+        probe
+    }
+
+    fn mounted_filesystem_size(path: &Path) -> u64 {
+        let output = Command::new("df")
+            .args(["-B1", "--output=size", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_ascii_whitespace()
+            .filter_map(|value| value.parse::<u64>().ok())
+            .next()
+            .unwrap()
+    }
 
     struct Ext4StressConfig {
         workers: usize,
@@ -423,6 +488,166 @@ mod tests {
         assert!(parse_device_id("8").is_err());
         assert!(parse_device_id("8:0:1").is_err());
         assert!(parse_device_id("invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_source_requires_a_key_before_touching_media() {
+        let device = tempfile::NamedTempFile::new().unwrap();
+        device.as_file().set_len(AUTO_PROBE_BYTES as u64).unwrap();
+        let before = read_auto_probe(device.path());
+        let options = HashMap::from([
+            ("sourceType".to_string(), "auto".to_string()),
+            ("targetType".to_string(), "fileSystem".to_string()),
+            (
+                "devicePath".to_string(),
+                device.path().to_string_lossy().to_string(),
+            ),
+            ("encryptionType".to_string(), "luks2".to_string()),
+            ("filesystemType".to_string(), "ext4".to_string()),
+        ]);
+
+        let mut block_device = BlockDevice::default();
+        let mount_point = TempDir::new().unwrap();
+        let err = block_device
+            .real_mount(&options, &[], mount_point.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlockDeviceError::AutoSourceRequiresKey));
+        assert_eq!(before, read_auto_probe(device.path()));
+    }
+
+    #[tokio::test]
+    async fn auto_source_refuses_corrupt_or_unknown_nonzero_media_without_mutation() {
+        for marker in [
+            b"unknown-media".as_slice(),
+            b"LUKS\xba\xbe\0\x02corrupt".as_slice(),
+        ] {
+            let mut device = tempfile::NamedTempFile::new().unwrap();
+            device.as_file().set_len(AUTO_PROBE_BYTES as u64).unwrap();
+            device.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+            device.as_file_mut().write_all(marker).unwrap();
+            let before = read_auto_probe(device.path());
+            let mapper_name = format!("codewire-auto-refuse-{}", uuid::Uuid::new_v4());
+            let options = auto_filesystem_options(
+                device.path().to_str().unwrap(),
+                "./test_files/luks2-disk-passphrase",
+                &mapper_name,
+                true,
+            );
+
+            let mut block_device = BlockDevice::default();
+            let mount_point = TempDir::new().unwrap();
+            let err = block_device
+                .real_mount(&options, &[], mount_point.path().to_str().unwrap())
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("auto source refused"));
+            assert_eq!(before, read_auto_probe(device.path()));
+            assert!(!Path::new(&format!("/dev/mapper/{mapper_name}")).exists());
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(target_arch = "s390x", ignore)]
+    #[serial]
+    async fn auto_source_wrong_key_and_unsupported_filesystem_do_not_format() {
+        let mut device = tempfile::NamedTempFile::new().unwrap();
+        device.as_file_mut().set_len(64 * 1024 * 1024).unwrap();
+        let correct_key =
+            Zeroizing::new(std::fs::read("./test_files/luks2-disk-passphrase").unwrap());
+        Luks2Formatter::default()
+            .encrypt_device(device.path().to_str().unwrap(), None, correct_key)
+            .unwrap();
+        let before = read_auto_probe(device.path());
+
+        let mut wrong_key = tempfile::NamedTempFile::new().unwrap();
+        wrong_key.write_all(b"incorrect-test-passphrase").unwrap();
+        let mapper_name = format!("codewire-auto-wrong-key-{}", uuid::Uuid::new_v4());
+        let wrong_key_options = auto_filesystem_options(
+            device.path().to_str().unwrap(),
+            wrong_key.path().to_str().unwrap(),
+            &mapper_name,
+            false,
+        );
+        let mount_point = TempDir::new().unwrap();
+        let mut block_device = BlockDevice::default();
+        assert!(block_device
+            .real_mount(
+                &wrong_key_options,
+                &[],
+                mount_point.path().to_str().unwrap(),
+            )
+            .await
+            .is_err());
+        assert_eq!(before, read_auto_probe(device.path()));
+        assert!(!Path::new(&format!("/dev/mapper/{mapper_name}")).exists());
+
+        let mapper_name = format!("codewire-auto-unsupported-fs-{}", uuid::Uuid::new_v4());
+        let unsupported_options = auto_filesystem_options(
+            device.path().to_str().unwrap(),
+            "./test_files/luks2-disk-passphrase",
+            &mapper_name,
+            false,
+        );
+        let mut block_device = BlockDevice::default();
+        let err = block_device
+            .real_mount(
+                &unsupported_options,
+                &[],
+                mount_point.path().to_str().unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("decrypted filesystem is not ext4"));
+        assert_eq!(before, read_auto_probe(device.path()));
+        assert!(!Path::new(&format!("/dev/mapper/{mapper_name}")).exists());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(target_arch = "s390x", ignore)]
+    #[serial]
+    async fn auto_source_initializes_reopens_and_grows_ext4() {
+        let device = tempfile::NamedTempFile::new().unwrap();
+        device.as_file().set_len(128 * 1024 * 1024).unwrap();
+        let device_path = device.path().to_str().unwrap();
+        let key_path = "./test_files/luks2-disk-passphrase";
+        let mapper_name = format!("codewire-auto-grow-{}", uuid::Uuid::new_v4());
+        let _mapper_guard = CloseDeviceOnDrop(mapper_name.clone());
+        let mount_point = TempDir::new().unwrap();
+
+        let mut block_device = BlockDevice::default();
+        block_device
+            .real_mount(
+                &auto_filesystem_options(device_path, key_path, &mapper_name, false),
+                &[],
+                mount_point.path().to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        let initial_size = mounted_filesystem_size(mount_point.path());
+        tokio::fs::write(mount_point.path().join("persistent-marker"), b"present")
+            .await
+            .unwrap();
+        block_device.umount().await.unwrap();
+
+        device.as_file().set_len(256 * 1024 * 1024).unwrap();
+        let mut reopened = BlockDevice::default();
+        reopened
+            .real_mount(
+                &auto_filesystem_options(device_path, key_path, &mapper_name, true),
+                &[],
+                mount_point.path().to_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(mount_point.path().join("persistent-marker"))
+                .await
+                .unwrap(),
+            b"present"
+        );
+        assert!(mounted_filesystem_size(mount_point.path()) > initial_size);
+        reopened.umount().await.unwrap();
     }
 
     #[tokio::test]

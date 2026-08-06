@@ -150,7 +150,7 @@ pub fn create_zdataset(
     mount_point: &str,
 ) -> Result<()> {
     fs::create_dir_all(mount_point).context("create mount point")?;
-    let mut key_command = Vec::new();
+    let mut key_command = Zeroizing::new(Vec::new());
     key_command.write_all(&key)?;
     key_command.write_all(b"\n")?;
     key_command.write_all(&key)?;
@@ -181,7 +181,7 @@ pub fn import_zpool(pool_name: &str, device_path: &str) -> Result<()> {
 
 /// This function loads a key to a zdataset.
 pub fn load_key(pool_name: &str, dataset_name: &str, key: Zeroizing<Vec<u8>>) -> Result<()> {
-    let mut key_command = Vec::new();
+    let mut key_command = Zeroizing::new(Vec::new());
     key_command.write_all(&key)?;
     key_command.write_all(b"\n")?;
     key_command.write_all(&key)?;

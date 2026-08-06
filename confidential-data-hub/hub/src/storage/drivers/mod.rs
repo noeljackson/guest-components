@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use tempfile::NamedTempFile;
 use tracing::debug;
 use which::which;
+use zeroize::Zeroizing;
 
 pub mod filesystem;
 pub mod luks2;
@@ -21,7 +22,7 @@ pub mod zfs;
 pub fn run_command(
     command: &str,
     args: &[&str],
-    inputs: Option<Vec<u8>>,
+    inputs: Option<Zeroizing<Vec<u8>>>,
 ) -> Result<(String, String)> {
     let _ = which(command).with_context(|| format!("command `{command}` not found"))?;
     let mut status = Command::new(command)

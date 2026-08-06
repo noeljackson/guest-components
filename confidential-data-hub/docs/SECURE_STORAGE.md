@@ -78,12 +78,19 @@ In both modes, the cleartext device or filesystem is only exposed inside the TEE
 
 - **Common request shape**: Both modes use `volume_type: "block-device"` and share the same basic options:
   - `deviceId` / `devicePath`: identify the block device.
-  - `sourceType`: `"empty"` (new/unencrypted device) or `"encrypted"` (existing encrypted device).
+  - `sourceType`: `"empty"` (legacy new/unencrypted device), `"encrypted"`
+    (known existing encrypted device), or LUKS2-only `"auto"` for persistent
+    ext4 storage.
   - `key`: where to fetch the encryption key (`"sealed.*"`, `"kbs://..."`, or `"file://..."`).
 - **LUKS2 mode**:
   - Uses `targetType` to decide whether to expose a cleartext **device** (`"device"`) or a cleartext **filesystem** (`"fileSystem"`).
   - Can optionally enable dm-integrity via `dataIntegrity`.
   - Uses a `/dev/mapper/<name>` device created by `cryptsetup` as the cleartext device.
+  - With `sourceType: "auto"`, requires an explicit key and an ext4 filesystem
+    target. It reopens valid on-device LUKS2 media, initializes only a completely
+    zeroed bounded probe region, and refuses corrupt or unknown non-zero media.
+  - With `grow: "true"`, runs idempotent online `resize2fs` after a successful
+    ext4 reopen and mount.
   - When formatting an empty ext4 filesystem with dm-integrity enabled, CDH
     defaults `lazy_itable_init` to `0` unless the caller explicitly provides a
     `lazy_itable_init` setting in `mkfsOpts`.
