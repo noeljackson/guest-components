@@ -8,7 +8,6 @@ members = [
     "attestation-agent/attester",
     "attestation-agent/deps/resource_uri",
     "attestation-agent/deps/crypto",
-    "attestation-agent/deps/sev",
     "attestation-agent/coco_keyprovider",
     "confidential-data-hub/hub",
     "confidential-data-hub/kms",
@@ -24,9 +23,17 @@ anyhow = "1.0"
 assert-json-diff = "2.0"
 assert_cmd = "2"
 async-trait = "0.1.89"
-aws-sdk-kms = { version = "1.109", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-aws-sdk-secretsmanager = { version = "1.109", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
-base64 = "0.22.1"
+aws-sdk-kms = { version = "1.109", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-secretsmanager = { version = "1.109", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
+base64 = "0.23.1"
 base64-serde = "0.8"
 bincode = "2.0.1"
 cfg-if = "1.0.4"
@@ -74,4 +81,3 @@ ttrpc-codegen = "0.6.0"
 url = "2.5.4"
 uuid = "1"
 zeroize = "1.8.2"
-

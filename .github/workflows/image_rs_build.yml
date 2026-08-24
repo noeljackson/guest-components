@@ -21,6 +21,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   ci:
     permissions:
@@ -40,7 +42,7 @@ jobs:
     runs-on: ${{ matrix.instance }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -130,7 +132,7 @@ jobs:
           sudo -E PATH=$PATH -s cargo clean
 
       - name: Run cargo test - kata-cc (native-tls version) with keywrap-ttrpc (default) + keywrap-jwe and with signatures from XRSS registry extension
-        env:
-          AUTH_PASSWORD: ${{ secrets.SH_ICR_API_KEY }}
         run: |
           sudo -E PATH=$PATH -s cargo test -p image-rs --no-default-features --features=kata-cc-native-tls,keywrap-jwe,signature-simple-xrss
+        env:
+          AUTH_PASSWORD: ${{ secrets.SH_ICR_API_KEY }} # zizmor: ignore[secrets-outside-env]

@@ -8,13 +8,8 @@ LIBC ?= musl
 
 ATTESTER ?=
 
-NO_RESOURCE_PROVIDER ?=
-
-ifeq ($(NO_RESOURCE_PROVIDER), true)
-  RESOURCE_PROVIDER :=
-else
-  RESOURCE_PROVIDER ?= kbs
-endif
+# Enable the `kbs` cargo feature (cc_kbc / CoCo KBS). offline_fs_kbc is always built.
+ENABLE_KBS ?= true
 
 ifeq ($(ARCH), ppc64le)
   ARCH=powerpc64le
@@ -28,31 +23,14 @@ else ifeq ($(TEE_PLATFORM), tdx)
   ATTESTER = tdx-attester
 else ifeq ($(TEE_PLATFORM), az-cvm-vtpm)
   ATTESTER = az-snp-vtpm-attester,az-tdx-vtpm-attester
-else ifeq ($(TEE_PLATFORM), sev)
-  ATTESTER = none
-  ifeq ($(NO_RESOURCE_PROVIDER), true)
-    RESOURCE_PROVIDER :=
-  else
-    RESOURCE_PROVIDER = sev
-  endif
 else ifeq ($(TEE_PLATFORM), snp)
   ATTESTER = snp-attester
 else ifeq ($(TEE_PLATFORM), se)
   ATTESTER = se-attester
 else ifeq ($(TEE_PLATFORM), all)
   ATTESTER = all-attesters
-  ifeq ($(NO_RESOURCE_PROVIDER), true)
-    RESOURCE_PROVIDER :=
-  else
-    RESOURCE_PROVIDER = sev,kbs
-  endif
 else ifeq ($(TEE_PLATFORM), amd)
   ATTESTER = snp-attester
-  ifeq ($(NO_RESOURCE_PROVIDER), true)
-    RESOURCE_PROVIDER :=
-  else
-    RESOURCE_PROVIDER = sev,kbs
-  endif
 else ifeq ($(TEE_PLATFORM), cca)
   ATTESTER = cca-attester
 endif
@@ -86,7 +64,7 @@ build: $(CDH_BINARY) $(ASR_BINARY) $(AA_BINARY)
 
 $(CDH_BINARY):
 	@echo build $(CDH) for $(TEE_PLATFORM)
-	cd $(CDH) && $(MAKE) RESOURCE_PROVIDER=$(RESOURCE_PROVIDER) ARCH=$(ARCH) LIBC=$(LIBC)
+	cd $(CDH) && $(MAKE) ENABLE_KBS=$(ENABLE_KBS) ARCH=$(ARCH) LIBC=$(LIBC)
 
 $(AA_BINARY):
 	@echo build $(AA) for $(TEE_PLATFORM)

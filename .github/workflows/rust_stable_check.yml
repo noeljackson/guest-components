@@ -5,11 +5,16 @@ on:
   schedule:
     - cron: '0 3 * * 6'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
   clippy:
+    name: Run clippy (${{ matrix.package }})
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -62,4 +67,7 @@ jobs:
         uses: ./.github/actions/install-nvat-sdk
 
       - name: Run rust lint checks (${{matrix.package}})
-        run: cargo clippy -p ${{matrix.package}} ${{matrix.feature-parameters}} -- -D warnings
+        env:
+          PACKAGE: ${{matrix.package}}
+          FEATURE_PARAMETERS: ${{matrix.feature-parameters}}
+        run: cargo clippy -p ${PACKAGE} ${FEATURE_PARAMETERS} -- -D warnings

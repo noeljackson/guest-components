@@ -14,6 +14,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 jobs:
   trustee_attester_ci:
     permissions:
@@ -39,7 +41,7 @@ jobs:
     runs-on: ${{ matrix.instance }}
     steps:
       - name: Harden the runner (Audit all outbound calls)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -70,13 +72,19 @@ jobs:
           sudo apt-get install -y libdevmapper-dev
 
       - name: Run cargo build
-        run: cargo build ${{ matrix.cargo_test_opts }}
+        env:
+          CARGO_TEST_OPTS: ${{ matrix.cargo_test_opts }}
+        run: cargo build ${CARGO_TEST_OPTS}
 
       - name: Run cargo test
-        run: cargo test ${{ matrix.cargo_test_opts }}
+        env:
+          CARGO_TEST_OPTS: ${{ matrix.cargo_test_opts }}
+        run: cargo test ${CARGO_TEST_OPTS}
 
       - name: Run cargo fmt check
         run: cargo fmt --all -- --check
 
       - name: Run rust clippy
-        run: cargo clippy ${{ matrix.cargo_test_opts }}
+        env:
+          CARGO_TEST_OPTS: ${{ matrix.cargo_test_opts }}
+        run: cargo clippy ${CARGO_TEST_OPTS}
