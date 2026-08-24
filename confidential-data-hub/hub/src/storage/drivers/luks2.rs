@@ -62,7 +62,10 @@ const PERSISTENT_KEY_MIN_BYTES: usize = 32;
 const PERSISTENT_KEY_MAX_BYTES: usize = 4096;
 const PERSISTENT_MAPPER_PREFIX: &str = "coco-pv-";
 const ZERO_SCAN_BUFFER_SIZE: usize = 16 * 1024 * 1024;
-const ZERO_SCAN_PROGRESS_INTERVAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+// First-use verification is deliberately a complete-device scan. Keep its
+// progress interval below the smallest supported persistent workspace so a
+// slow, healthy initialization cannot be mistaken for a stalled CDH request.
+const ZERO_SCAN_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 // The header MAC cannot live in the header it authenticates or in data that is
 // unavailable before the mapper opens. Fix the LUKS2 header at 16 MiB and move
