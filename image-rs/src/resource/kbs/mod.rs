@@ -13,7 +13,10 @@
 //! `kbs://example.org/alice/key/1` will be stored in
 //! `/run/image-security/kbs/cde48578964b30b0aa8cecf04c020f64f7cce36fc391b24f45cf8d4e5368e229`
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -67,11 +70,25 @@ impl SecureChannel {
     /// * `decrypt_config`: a string with format `provider:attestation-agent:<kbc_name>::<kbs_uri>`.
     ///   This parameter is only used when in native secure channel (for enclave-cc)
     pub fn new(_kbc_name: &str, _kbs_uri: &str, work_dir: &Path) -> Result<Self> {
+        Self::new_with_timeout(
+            _kbc_name,
+            _kbs_uri,
+            work_dir,
+            crate::config::ImageConfig::default().resource_provider_timeout(),
+        )
+    }
+
+    pub(crate) fn new_with_timeout(
+        _kbc_name: &str,
+        _kbs_uri: &str,
+        work_dir: &Path,
+        _resource_provider_timeout: Duration,
+    ) -> Result<Self> {
         let client: Box<dyn Client> = {
             cfg_if::cfg_if! {
                 if #[cfg(feature = "keywrap-ttrpc")] {
                     info!("secure channel uses ttrpc");
-                    Box::<ttrpc::Ttrpc>::default()
+                    Box::new(ttrpc::Ttrpc::new(_resource_provider_timeout))
                 } else if #[cfg(feature = "keywrap-native")] {
                     info!("secure channel uses native-aa");
                     Box::new(native::Native::new(_kbc_name, _kbs_uri)?)
