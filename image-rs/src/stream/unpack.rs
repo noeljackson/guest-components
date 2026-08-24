@@ -76,7 +76,7 @@ pub enum UnpackError {
         source: anyhow::Error,
     },
 
-    #[error("Failed to unpack layer to destination")]
+    #[error("Failed to unpack layer to destination: {source}")]
     UnpackFailed {
         #[source]
         source: io::Error,
@@ -576,6 +576,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn unpack_error_includes_io_cause() {
+        let source = io::Error::from(io::ErrorKind::PermissionDenied);
+        let source_message = source.to_string();
+        let error = UnpackError::UnpackFailed { source };
+
+        assert!(error.to_string().contains(&source_message));
+    }
 
     #[tokio::test]
     #[cfg_attr(target_arch = "s390x", ignore)]
