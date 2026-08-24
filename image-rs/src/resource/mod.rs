@@ -10,7 +10,7 @@
 //! - `file://`: from the local filesystem
 //! - `kbs://`: using secure channel to fetch from the KBS
 
-use std::{io, path::Path};
+use std::{io, path::Path, time::Duration};
 
 use anyhow::anyhow;
 use thiserror::Error;
@@ -56,9 +56,28 @@ pub struct ResourceProvider {
 
 impl ResourceProvider {
     pub fn new(_kbc_name: &str, _kbs_uri: &str, _work_dir: &Path) -> ResourceResult<Self> {
+        Self::new_with_timeout(
+            _kbc_name,
+            _kbs_uri,
+            _work_dir,
+            crate::config::ImageConfig::default().resource_provider_timeout(),
+        )
+    }
+
+    pub(crate) fn new_with_timeout(
+        _kbc_name: &str,
+        _kbs_uri: &str,
+        _work_dir: &Path,
+        _resource_provider_timeout: Duration,
+    ) -> ResourceResult<Self> {
         #[cfg(feature = "kbs")]
-        let secure_channel = kbs::SecureChannel::new(_kbc_name, _kbs_uri, _work_dir)
-            .map_err(|source| ResourceError::EstablishSecureChannel { source })?;
+        let secure_channel = kbs::SecureChannel::new_with_timeout(
+            _kbc_name,
+            _kbs_uri,
+            _work_dir,
+            _resource_provider_timeout,
+        )
+        .map_err(|source| ResourceError::EstablishSecureChannel { source })?;
         Ok(Self {
             #[cfg(feature = "kbs")]
             secure_channel,

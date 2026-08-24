@@ -6,7 +6,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tracing::debug;
 
 use crate::registry::Config as RegistryConfig;
@@ -27,6 +29,9 @@ pub const AUTH_FILE_PATH: &str = "kbs:///default/credential/test";
 
 /// Default max concurrent downloads
 pub const DEFAULT_MAX_CONCURRENT_DOWNLOAD: usize = 3;
+
+/// Default timeout for retrieving one resource from the configured provider.
+pub const DEFAULT_RESOURCE_PROVIDER_TIMEOUT_SECS: u32 = 50;
 
 /// Path to the configuration file to generate ImageConfiguration
 pub const CONFIGURATION_FILE_NAME: &str = "config.json";
@@ -153,6 +158,12 @@ pub struct ImageConfig {
     #[serde(default = "default_max_concurrent_layer_downloads_per_image")]
     pub max_concurrent_layer_downloads_per_image: usize,
 
+    /// Timeout in seconds for retrieving one image resource from the configured
+    /// provider. This includes any attestation required before the provider can
+    /// return a protected resource.
+    #[serde(default = "default_resource_provider_timeout_secs")]
+    pub resource_provider_timeout_secs: NonZeroU32,
+
     /// Proxy configuration for pulling images.
     #[serde(default = "Option::default")]
     pub image_pull_proxy: Option<ProxyConfig>,
@@ -187,6 +198,11 @@ __default_deserialization_value!(
 
 __default_deserialization_value!(default_work_dir, PathBuf, PathBuf::from(DEFAULT_WORK_DIR));
 
+fn default_resource_provider_timeout_secs() -> NonZeroU32 {
+    NonZeroU32::new(DEFAULT_RESOURCE_PROVIDER_TIMEOUT_SECS)
+        .expect("the default resource-provider timeout must be nonzero")
+}
+
 #[cfg(feature = "keywrap-native")]
 __default_deserialization_value!(default_kbc, String, "sample_kbc".into());
 
@@ -200,6 +216,7 @@ impl Default for ImageConfig {
             work_dir: PathBuf::from(DEFAULT_WORK_DIR.to_string()),
             default_snapshot: SnapshotType::default(),
             max_concurrent_layer_downloads_per_image: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
+            resource_provider_timeout_secs: default_resource_provider_timeout_secs(),
             image_security_policy_uri: None,
             image_security_policy: None,
             sigstore_config_uri: None,
@@ -227,6 +244,7 @@ struct KernelParameterConfigs {
     authenticated_registry_credentials_uri: Option<String>,
     image_security_policy_uri: Option<String>,
     enable_signature_verification: bool,
+    resource_provider_timeout_secs: Option<NonZeroU32>,
 }
 
 impl KernelParameterConfigs {
@@ -250,6 +268,9 @@ impl KernelParameterConfigs {
                 .get("agent.enable_signature_verification")
                 .map(|s| s.parse::<bool>().unwrap_or(false))
                 .unwrap_or_default(),
+            resource_provider_timeout_secs: cmdline
+                .get("agent.image_resource_timeout_secs")
+                .and_then(|value| value.parse::<NonZeroU32>().ok()),
         }
     }
 }
@@ -277,6 +298,7 @@ impl ImageConfig {
             work_dir: PathBuf::from(DEFAULT_WORK_DIR.to_string()),
             default_snapshot: SnapshotType::default(),
             max_concurrent_layer_downloads_per_image: DEFAULT_MAX_CONCURRENT_DOWNLOAD,
+            resource_provider_timeout_secs: default_resource_provider_timeout_secs(),
             image_security_policy_uri: None,
             image_security_policy: None,
             sigstore_config_uri: None,
@@ -315,6 +337,10 @@ impl ImageConfig {
             {
                 res.image_pull_proxy = Some(image_pull_proxy);
             }
+
+            if let Some(timeout) = parameters_from_kernel.resource_provider_timeout_secs {
+                res.resource_provider_timeout_secs = timeout;
+            }
         }
 
         res
@@ -326,6 +352,10 @@ impl ImageConfig {
             work_dir: image_work_dir,
             ..Default::default()
         }
+    }
+
+    pub(crate) fn resource_provider_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.resource_provider_timeout_secs.get()))
     }
 }
 
@@ -345,7 +375,8 @@ mod tests {
             no_proxy: None,
             authenticated_registry_credentials_uri: None,
             image_security_policy_uri: None,
-            enable_signature_verification: false
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -356,7 +387,8 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: None,
             image_security_policy_uri: None,
-            enable_signature_verification: false
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -367,7 +399,8 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: Some("kbs:///default/credentials/test".into()),
             image_security_policy_uri: None,
-            enable_signature_verification: false
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -378,7 +411,8 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: Some("file:///root/.docker/config.json".into()),
             image_security_policy_uri: None,
-            enable_signature_verification: false
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -389,7 +423,8 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: Some("kbs:///a/b/c".into()),
             image_security_policy_uri: Some("kbs:///default/image-policy/test".into()),
-            enable_signature_verification: false
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -400,7 +435,8 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: Some("kbs:///a/b/c".into()),
             image_security_policy_uri: Some("file:///etc/image-policy.json".into()),
-            enable_signature_verification: false
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -411,7 +447,8 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: Some("kbs:///a/b/c".into()),
             image_security_policy_uri: Some("file:///etc/image-policy.json".into()),
-            enable_signature_verification: true
+            enable_signature_verification: true,
+            resource_provider_timeout_secs: None
         }
     )]
     #[case("
@@ -422,7 +459,32 @@ mod tests {
             no_proxy: Some("localhost".into()),
             authenticated_registry_credentials_uri: Some("kbs:///a/b/c".into()),
             image_security_policy_uri: Some("file:///etc/image-policy.json".into()),
-            enable_signature_verification: true
+            enable_signature_verification: true,
+            resource_provider_timeout_secs: None
+        }
+    )]
+    #[case(
+        "agent.image_resource_timeout_secs=300",
+        KernelParameterConfigs {
+            https_proxy: None,
+            http_proxy: None,
+            no_proxy: None,
+            authenticated_registry_credentials_uri: None,
+            image_security_policy_uri: None,
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: NonZeroU32::new(300)
+        }
+    )]
+    #[case(
+        "agent.image_resource_timeout_secs=0",
+        KernelParameterConfigs {
+            https_proxy: None,
+            http_proxy: None,
+            no_proxy: None,
+            authenticated_registry_credentials_uri: None,
+            image_security_policy_uri: None,
+            enable_signature_verification: false,
+            resource_provider_timeout_secs: None
         }
     )]
     fn test_parse_kernel_parameter(
@@ -444,6 +506,10 @@ mod tests {
             config.max_concurrent_layer_downloads_per_image,
             DEFAULT_MAX_CONCURRENT_DOWNLOAD
         );
+        assert_eq!(
+            config.resource_provider_timeout_secs.get(),
+            DEFAULT_RESOURCE_PROVIDER_TIMEOUT_SECS
+        );
 
         let env_work_dir = "/tmp";
         let config = ImageConfig::new(PathBuf::from(env_work_dir));
@@ -458,6 +524,7 @@ mod tests {
             "default_snapshot": "overlay",
             "image_security_policy_uri": "file:///etc/image-policy.json",
             "authenticated_registry_credentials_uri": "file:///etc/image-auth.json",
+            "resource_provider_timeout_secs": 300,
 	        "max_concurrent_layer_downloads_per_image": 1
         }"#;
 
@@ -475,6 +542,7 @@ mod tests {
         assert_eq!(config.work_dir, work_dir);
         assert_eq!(config.default_snapshot, SnapshotType::Overlay);
         assert_eq!(config.max_concurrent_layer_downloads_per_image, 1);
+        assert_eq!(config.resource_provider_timeout_secs.get(), 300);
         assert_eq!(
             config.image_security_policy_uri,
             Some("file:///etc/image-policy.json".to_string())
@@ -489,5 +557,21 @@ mod tests {
 
         let _ = ImageConfig::try_from(invalid_config_file.as_path()).is_err();
         assert!(!invalid_config_file.exists());
+    }
+
+    #[test]
+    fn test_image_config_rejects_zero_resource_provider_timeout() {
+        let data = r#"{
+            "resource_provider_timeout_secs": 0
+        }"#;
+        let tempdir = tempfile::tempdir().unwrap();
+        let config_file = tempdir.path().join("config.json");
+
+        File::create(&config_file)
+            .unwrap()
+            .write_all(data.as_bytes())
+            .unwrap();
+
+        assert!(ImageConfig::try_from(config_file.as_path()).is_err());
     }
 }
