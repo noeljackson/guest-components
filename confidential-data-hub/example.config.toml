@@ -73,6 +73,12 @@ resource_uri = "kbs:///default/test/file"
 # This defaults to 3.
 max_concurrent_layer_downloads_per_image = 3
 
+# The maximum time in seconds to retrieve one image resource. This includes
+# any attestation required before a protected resource can be returned.
+#
+# This defaults to 50.
+resource_provider_timeout_secs = 50
+
 # Sigstore config file URI for simple signing scheme.
 #
 # When `image_security_policy_uri` or `image_security_policy` is set and

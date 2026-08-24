@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{path::PathBuf, sync::Arc};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc};
 
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -90,6 +90,7 @@ impl ClientBuilder {
     );
 
     __impl_config!(max_concurrent_layer_downloads_per_image, usize);
+    __impl_config!(resource_provider_timeout_secs, NonZeroU32);
 
     #[cfg(feature = "keywrap-native")]
     __impl_config!(kbc, String);
@@ -99,14 +100,20 @@ impl ClientBuilder {
 
     pub async fn build(self) -> BuilderResult<ImageClient> {
         #[cfg(feature = "keywrap-native")]
-        let resource_provider = Arc::new(ResourceProvider::new(
+        let resource_provider = Arc::new(ResourceProvider::new_with_timeout(
             &self.config.kbc,
             &self.config.kbs_uri,
             &self.config.work_dir,
+            self.config.resource_provider_timeout(),
         )?);
 
         #[cfg(not(feature = "keywrap-native"))]
-        let resource_provider = Arc::new(ResourceProvider::new("", "", &self.config.work_dir)?);
+        let resource_provider = Arc::new(ResourceProvider::new_with_timeout(
+            "",
+            "",
+            &self.config.work_dir,
+            self.config.resource_provider_timeout(),
+        )?);
 
         let registry_auth = match &self.config.authenticated_registry_credentials_uri {
             Some(uri) => {
