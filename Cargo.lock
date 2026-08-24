@@ -4321,6 +4321,7 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "tokio",
+ "url",
  "zeroize",
 ]
 
