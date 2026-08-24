@@ -51,7 +51,13 @@ mod tests {
     use super::*;
     use anyhow::anyhow;
     use image_rs::signature::SignatureError;
+    use image_rs::{
+        image::PullImageError,
+        pull::PullLayerError,
+        stream::{StreamError, UnpackError},
+    };
     use rstest::rstest;
+    use std::io;
 
     #[rstest]
     #[case(Error::KbsClient { source: kms::Error::KbsClientError("details".into()) }, "kbs client initialization failed")]
@@ -70,5 +76,20 @@ mod tests {
     fn test_brief_message(#[case] error: Error, #[case] expected: &str) {
         let brief_message = error.to_string();
         assert_eq!(brief_message, expected);
+    }
+
+    #[test]
+    fn image_pull_unpack_error_preserves_io_cause() {
+        let source = io::Error::from(io::ErrorKind::PermissionDenied);
+        let source_message = source.to_string();
+        let error = Error::ImagePull(PullImageError::PullLayersFailed(
+            PullLayerError::HandleStreamError(StreamError::UnPackLayerFailed(
+                UnpackError::UnpackFailed { source },
+            )),
+        ));
+
+        let message = error.to_string();
+        assert!(message.contains("Failed to unpack layer to destination"));
+        assert!(message.contains(&source_message));
     }
 }
