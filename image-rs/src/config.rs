@@ -354,7 +354,8 @@ impl ImageConfig {
         }
     }
 
-    pub(crate) fn resource_provider_timeout(&self) -> Duration {
+    /// Deadline used for resource-provider requests initiated by this image client.
+    pub fn resource_provider_timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.resource_provider_timeout_secs.get()))
     }
 }
