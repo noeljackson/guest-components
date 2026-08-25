@@ -196,6 +196,10 @@ impl CdhConfig {
 }
 
 impl CdhConfig {
+    fn aa_token_request_timeout_secs(&self) -> u64 {
+        self.image.resource_provider_timeout().as_secs()
+    }
+
     pub fn set_configuration_envs(&self) -> Result<()> {
         if env::var("AA_KBC_PARAMS").is_err() {
             env::set_var(
@@ -206,6 +210,10 @@ impl CdhConfig {
         if env::var("AA_SOCKET").is_err() {
             env::set_var("AA_SOCKET", &self.aa.aa_socket);
         }
+        env::set_var(
+            kms::plugins::kbs::AA_TOKEN_REQUEST_TIMEOUT_SECS_ENV,
+            self.aa_token_request_timeout_secs().to_string(),
+        );
         // KBS configurations
         if let Some(kbs_cert) = &self.kbc.kbs_cert {
             env::set_var("KBS_CERT", kbs_cert);
@@ -441,5 +449,27 @@ image_security_policy = """
             Some(cfg) => assert_eq!(cfg, res.unwrap()),
             None => assert!(res.is_err()),
         }
+    }
+
+    #[test]
+    fn aa_token_timeout_tracks_image_resource_timeout() {
+        let mut file = tempfile::Builder::new()
+            .append(true)
+            .suffix(".toml")
+            .tempfile()
+            .unwrap();
+        file.write_all(
+            br#"
+[kbc]
+name = "offline_fs_kbc"
+
+[image]
+resource_provider_timeout_secs = 300
+"#,
+        )
+        .unwrap();
+
+        let config = CdhConfig::from_file(file.path().to_str().unwrap()).unwrap();
+        assert_eq!(config.aa_token_request_timeout_secs(), 300);
     }
 }
