@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::env;
+use std::{env, time::Duration};
 
 use async_trait::async_trait;
 use kbs_protocol::{
@@ -28,6 +28,27 @@ impl CcKbc {
             .map_err(|e| {
                 Error::KbsClientError(format!("create AA token provider failed: {e:?}"))
             })?;
+        Self::new_with_token_provider(kbs_host_url, token_provider)
+    }
+
+    pub async fn new_with_timeout(
+        kbs_host_url: &str,
+        aa_socket: &str,
+        request_timeout: Duration,
+    ) -> Result<Self> {
+        let token_provider =
+            AATokenProvider::new_with_socket_and_timeout(aa_socket, request_timeout)
+                .await
+                .map_err(|e| {
+                    Error::KbsClientError(format!("create AA token provider failed: {e:?}"))
+                })?;
+        Self::new_with_token_provider(kbs_host_url, token_provider)
+    }
+
+    fn new_with_token_provider(
+        kbs_host_url: &str,
+        token_provider: AATokenProvider,
+    ) -> Result<Self> {
         let client = kbs_protocol::KbsClientBuilder::with_token_provider(
             Box::new(token_provider),
             kbs_host_url,

@@ -45,7 +45,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 	exec sudo -E bash "$0" "$@"
 fi
 
-for cmd in cp dd losetup mkfs.erofs parted partprobe sed stat truncate veritysetup; do
+for cmd in cmp cp dd fsck.erofs losetup mkfs.erofs parted partprobe sed stat truncate veritysetup; do
 	command -v "${cmd}" >/dev/null 2>&1 || die "${cmd} is required"
 done
 
@@ -193,6 +193,24 @@ setup_verity() {
 	printf '%s\n' "${kernel_verity_params}" > "${root_hash_file}"
 }
 
+verify_erofs_payload() {
+	local device="$1"
+	local extracted_dir
+	local expected_cdh="${ROOTFS_DIR}/usr/local/bin/confidential-data-hub"
+	local actual_cdh
+
+	[[ -f "${expected_cdh}" && -x "${expected_cdh}" ]] || \
+		die "assembled rootfs lacks executable confidential-data-hub"
+	extracted_dir="$(make_temp_dir)/rootfs"
+	fsck.erofs --extract="${extracted_dir}" "${device}p1" >/dev/null
+	actual_cdh="${extracted_dir}/usr/local/bin/confidential-data-hub"
+	[[ -f "${actual_cdh}" && -x "${actual_cdh}" ]] || \
+		die "EROFS payload lacks executable confidential-data-hub"
+	cmp -s "${expected_cdh}" "${actual_cdh}" || \
+		die "EROFS confidential-data-hub differs from the assembled rootfs"
+	info "Verified confidential-data-hub in the EROFS payload"
+}
+
 build_image() {
 	local image="${OUTPUT_DIR}/${IMAGE_NAME}"
 	local root_hash_file="${OUTPUT_DIR}/root_hash_${BUILD_VARIANT}.txt"
@@ -215,6 +233,7 @@ build_image() {
 
 	info "Writing EROFS payload to ${device}p1"
 	dd if="${fs_image}" of="${device}p1" bs=4M conv=fsync status=none
+	verify_erofs_payload "${device}"
 
 	setup_verity "${device}" "${root_hash_file}"
 
