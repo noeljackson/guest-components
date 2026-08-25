@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use attester::{BoxedAttester, detect_attestable_devices, detect_tee_type};
 use kbs_types::Tee;
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, RwLock};
 
 pub use attester::InitDataResult;
@@ -149,29 +149,39 @@ impl AttestationAgent {
     pub fn set_initdata_toml(&mut self, initdata_toml: String) {
         self.initdata = Some(initdata_toml);
     }
-}
 
-#[async_trait]
-impl AttestationAPIs for AttestationAgent {
-    async fn get_token(&self, token_type: &str) -> Result<Vec<u8>> {
+    /// Get a token while applying the selected timeout to each KBS HTTP request.
+    pub async fn get_token_with_request_timeout(
+        &self,
+        token_type: &str,
+        request_timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        self.get_token_inner(token_type, Some(request_timeout))
+            .await
+    }
+
+    async fn get_token_inner(
+        &self,
+        token_type: &str,
+        request_timeout: Option<Duration>,
+    ) -> Result<Vec<u8>> {
         let token_type = TokenType::from_str(token_type).context("Unsupported token type")?;
 
         match token_type {
             #[cfg(feature = "kbs")]
             token::TokenType::Kbs => {
-                token::kbs::KbsTokenGetter::new(
-                    self.config
-                        .read()
-                        .await
-                        .token_configs
-                        .kbs
-                        .as_ref()
-                        .ok_or(anyhow::anyhow!(
-                            "kbs token config not configured in config file"
-                        ))?,
-                )
-                .get_token(self.initdata.as_deref())
-                .await
+                let config = self.config.read().await;
+                let config = config.token_configs.kbs.as_ref().ok_or(anyhow::anyhow!(
+                    "kbs token config not configured in config file"
+                ))?;
+                let getter = match request_timeout {
+                    Some(timeout) => {
+                        token::kbs::KbsTokenGetter::new_with_request_timeout(config, timeout)
+                    }
+                    None => token::kbs::KbsTokenGetter::new(config),
+                };
+
+                getter.get_token(self.initdata.as_deref()).await
             }
             // TODO: add initdata plaintext for CoCoAS token
             #[cfg(feature = "coco_as")]
@@ -191,6 +201,13 @@ impl AttestationAPIs for AttestationAgent {
                 .await
             }
         }
+    }
+}
+
+#[async_trait]
+impl AttestationAPIs for AttestationAgent {
+    async fn get_token(&self, token_type: &str) -> Result<Vec<u8>> {
+        self.get_token_inner(token_type, None).await
     }
 
     /// Get TEE hardware evidence from the primary attester with runtime

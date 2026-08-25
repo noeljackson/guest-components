@@ -18,6 +18,7 @@ use crate::{
 use super::client::KbsClient;
 
 const KBS_REQ_TIMEOUT_SEC: u64 = 60;
+const DEFAULT_KBS_REQUEST_TIMEOUT: Duration = Duration::from_secs(KBS_REQ_TIMEOUT_SEC);
 
 pub struct KbsClientBuilder<T> {
     provider: T,
@@ -28,6 +29,7 @@ pub struct KbsClientBuilder<T> {
     tee_key_algorithm: TeeKeyAlgorithm,
     initdata: Option<String>,
     attestation_policy_selector: Option<String>,
+    request_timeout: Duration,
 }
 
 impl KbsClientBuilder<Box<dyn EvidenceProvider>> {
@@ -44,6 +46,7 @@ impl KbsClientBuilder<Box<dyn EvidenceProvider>> {
             tee_key_algorithm: TeeKeyAlgorithm::default(),
             initdata: None,
             attestation_policy_selector: None,
+            request_timeout: DEFAULT_KBS_REQUEST_TIMEOUT,
         }
     }
 }
@@ -59,6 +62,7 @@ impl KbsClientBuilder<Box<dyn TokenProvider>> {
             tee_key_algorithm: TeeKeyAlgorithm::default(),
             initdata: None,
             attestation_policy_selector: None,
+            request_timeout: DEFAULT_KBS_REQUEST_TIMEOUT,
         }
     }
 }
@@ -102,6 +106,12 @@ impl<T> KbsClientBuilder<T> {
         self
     }
 
+    /// Set the timeout applied to each KBS HTTP request.
+    pub fn set_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
     pub fn build(self) -> Result<KbsClient<T>> {
         let mut http_client_builder = reqwest::Client::builder()
             .cookie_store(true)
@@ -109,7 +119,7 @@ impl<T> KbsClientBuilder<T> {
                 "attestation-agent-kbs-client/{}",
                 env!("CARGO_PKG_VERSION")
             ))
-            .timeout(Duration::from_secs(KBS_REQ_TIMEOUT_SEC));
+            .timeout(self.request_timeout);
 
         for customer_root_cert in &self.kbs_certs {
             let cert = reqwest::Certificate::from_pem(customer_root_cert.as_bytes())
@@ -151,6 +161,8 @@ impl<T> KbsClientBuilder<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use rstest::rstest;
 
     use crate::{builder::KbsClientBuilder, evidence_provider::MockedEvidenceProvider};
@@ -203,5 +215,26 @@ x13TMfDeczAFBgMrZXADQQBpP6ABBkzVj3mF55nWUtP5vxwq3t91wqQJ6NyC7WsT
             client._attestation_policy_selector.as_deref(),
             attestation_policy_selector
         );
+    }
+
+    #[test]
+    fn request_timeout_defaults_to_sixty_seconds() {
+        let builder = KbsClientBuilder::with_evidence_provider(
+            Box::<MockedEvidenceProvider>::default(),
+            "test.io",
+        );
+
+        assert_eq!(builder.request_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn request_timeout_accepts_selected_deadline() {
+        let builder = KbsClientBuilder::with_evidence_provider(
+            Box::<MockedEvidenceProvider>::default(),
+            "test.io",
+        )
+        .set_request_timeout(Duration::from_secs(300));
+
+        assert_eq!(builder.request_timeout, Duration::from_secs(300));
     }
 }

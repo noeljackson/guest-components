@@ -8,6 +8,7 @@ use crate::config::kbs::KbsConfig;
 use anyhow::*;
 use kbs_protocol::{KbsClientBuilder, TeeKeyAlgorithm, evidence_provider::NativeEvidenceProvider};
 use serde::Serialize;
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct Message {
@@ -21,6 +22,7 @@ pub struct KbsTokenGetter {
     cert: Option<String>,
     tee_key_algorithm: TeeKeyAlgorithm,
     attestation_policy_selector: String,
+    request_timeout: Option<Duration>,
 }
 
 impl KbsTokenGetter {
@@ -34,6 +36,9 @@ impl KbsTokenGetter {
             builder = builder.add_kbs_cert(cert);
         }
         builder = builder.set_tee_key_algorithm(self.tee_key_algorithm);
+        if let Some(request_timeout) = self.request_timeout {
+            builder = builder.set_request_timeout(request_timeout);
+        }
 
         if !self.attestation_policy_selector.is_empty() {
             builder = builder.set_attestation_policy_selector(&self.attestation_policy_selector);
@@ -63,6 +68,38 @@ impl KbsTokenGetter {
             cert: config.cert.clone(),
             tee_key_algorithm: config.tee_key_algorithm,
             attestation_policy_selector: config.attestation_policy_selector.clone(),
+            request_timeout: None,
         }
+    }
+
+    pub fn new_with_request_timeout(config: &KbsConfig, request_timeout: Duration) -> Self {
+        Self {
+            request_timeout: Some(request_timeout),
+            ..Self::new(config)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> KbsConfig {
+        KbsConfig {
+            url: "https://kbs.example.test".to_string(),
+            cert: None,
+            tee_key_algorithm: TeeKeyAlgorithm::default(),
+            attestation_policy_selector: String::new(),
+        }
+    }
+
+    #[test]
+    fn request_timeout_is_only_selected_explicitly() {
+        assert_eq!(KbsTokenGetter::new(&config()).request_timeout, None);
+        assert_eq!(
+            KbsTokenGetter::new_with_request_timeout(&config(), Duration::from_secs(300))
+                .request_timeout,
+            Some(Duration::from_secs(300))
+        );
     }
 }
