@@ -12,12 +12,19 @@ mod offline_fs;
 
 use std::{env, sync::Arc};
 
+#[cfg(any(feature = "kbs", test))]
+use std::{num::NonZeroU32, time::Duration};
+
 use async_trait::async_trait;
 use attestation_agent::config::aa_kbc_params::AaKbcParams;
 pub use resource_uri::ResourceUri;
 use tokio::sync::Mutex;
 
 use crate::{Annotations, Error, Getter, Result};
+
+pub const AA_TOKEN_REQUEST_TIMEOUT_SECS_ENV: &str = "AA_TOKEN_REQUEST_TIMEOUT_SECS";
+#[cfg(any(feature = "kbs", test))]
+const DEFAULT_AA_TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 
 #[async_trait]
 pub trait Kbc: Send + Sync {
@@ -41,9 +48,13 @@ impl KbcClient {
         let c = match &params.kbc[..] {
             #[cfg(feature = "kbs")]
             "cc_kbc" => {
+                let request_timeout = aa_token_request_timeout(
+                    env::var(AA_TOKEN_REQUEST_TIMEOUT_SECS_ENV).ok().as_deref(),
+                )?;
                 let aa_socket = env::var("AA_SOCKET").expect("must be initialized");
                 Self::Cc(Arc::new(Mutex::new(
-                    cc_kbc::CcKbc::new(&params.uri, &aa_socket).await?,
+                    cc_kbc::CcKbc::new_with_timeout(&params.uri, &aa_socket, request_timeout)
+                        .await?,
                 )))
             }
             "offline_fs_kbc" => {
@@ -60,6 +71,17 @@ impl KbcClient {
     }
 }
 
+#[cfg(any(feature = "kbs", test))]
+fn aa_token_request_timeout(raw: Option<&str>) -> Result<Duration> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_AA_TOKEN_REQUEST_TIMEOUT);
+    };
+    let seconds = raw.parse::<NonZeroU32>().map_err(|e| {
+        Error::KbsClientError(format!("invalid {AA_TOKEN_REQUEST_TIMEOUT_SECS_ENV}: {e}"))
+    })?;
+    Ok(Duration::from_secs(u64::from(seconds.get())))
+}
+
 #[async_trait]
 impl Getter for KbcClient {
     async fn get_secret(&self, name: &str, _annotations: &Annotations) -> Result<Vec<u8>> {
@@ -71,5 +93,32 @@ impl Getter for KbcClient {
             Self::Cc(c) => c.lock().await.get_resource(resource_uri).await,
             Self::OfflineFs(c) => c.lock().await.get_resource(resource_uri).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_request_timeout_defaults_to_fifty_seconds() {
+        assert_eq!(
+            aa_token_request_timeout(None).unwrap(),
+            Duration::from_secs(50)
+        );
+    }
+
+    #[test]
+    fn token_request_timeout_accepts_trusted_override() {
+        assert_eq!(
+            aa_token_request_timeout(Some("300")).unwrap(),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn token_request_timeout_rejects_zero_and_malformed_values() {
+        assert!(aa_token_request_timeout(Some("0")).is_err());
+        assert!(aa_token_request_timeout(Some("invalid")).is_err());
     }
 }
