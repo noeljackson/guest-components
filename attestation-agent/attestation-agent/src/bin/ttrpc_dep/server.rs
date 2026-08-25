@@ -6,6 +6,7 @@
 use ::ttrpc::proto::Code;
 use async_trait::async_trait;
 use attestation_agent::{AttestationAPIs, AttestationAgent, RuntimeMeasurement};
+use std::time::Duration;
 
 use tracing::{debug, error};
 
@@ -27,16 +28,28 @@ pub struct AA {
     pub(crate) inner: AttestationAgent,
 }
 
+fn request_timeout(timeout_nano: i64) -> Option<Duration> {
+    (timeout_nano > 0).then(|| Duration::from_nanos(timeout_nano as u64))
+}
+
 #[async_trait]
 impl AttestationAgentService for AA {
     async fn get_token(
         &self,
-        _ctx: &::ttrpc::r#async::TtrpcContext,
+        ctx: &::ttrpc::r#async::TtrpcContext,
         req: GetTokenRequest,
     ) -> ::ttrpc::Result<GetTokenResponse> {
         debug!("AA (ttrpc): get token ...");
 
-        let token = self.inner.get_token(&req.TokenType).await.map_err(|e| {
+        let token = match request_timeout(ctx.timeout_nano) {
+            Some(timeout) => {
+                self.inner
+                    .get_token_with_request_timeout(&req.TokenType, timeout)
+                    .await
+            }
+            None => self.inner.get_token(&req.TokenType).await,
+        }
+        .map_err(|e| {
             error!("AA (ttrpc): get token failed\n {e:?}");
             let mut error_status = ::ttrpc::proto::Status::new();
             error_status.set_code(Code::INTERNAL);
@@ -198,5 +211,23 @@ impl AttestationAgentService for AA {
         }
         debug!("AA (ttrpc): get additional tees succeeded.");
         ::ttrpc::Result::Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_timeout_uses_explicit_ttrpc_deadline() {
+        assert_eq!(
+            request_timeout(300_000_000_000),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn request_timeout_preserves_default_without_deadline() {
+        assert_eq!(request_timeout(0), None);
     }
 }
