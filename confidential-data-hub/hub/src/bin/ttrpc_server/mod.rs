@@ -33,6 +33,13 @@ pub struct Server {
     hub: Hub,
 }
 
+fn secure_mount_error_message(detailed_error: &str) -> String {
+    // The request can contain key URIs and volume identities, so never echo it.
+    // The typed error chain is the minimum boundary needed to distinguish KBS,
+    // dm-crypt, dm-integrity, filesystem, and mount failures at the caller.
+    format!("[CDH] [ERROR]: {detailed_error}")
+}
+
 impl Server {
     pub async fn new(config: &CdhConfig) -> Result<Self> {
         let hub = Hub::new(config.clone()).await?;
@@ -166,13 +173,39 @@ impl SecureMountService for Server {
             error!("[ttRPC CDH] Secure Mount :\n{detailed_error}");
             let mut status = Status::new();
             status.set_code(Code::INTERNAL);
-            status.set_message(format!("[CDH] [ERROR]: {e}"));
+            status.set_message(secure_mount_error_message(&detailed_error));
             Error::RpcStatus(status)
         })?;
 
         let reply = SecureMountResponse::new();
         debug!("[ttRPC CDH] secure mount succeeded.");
         Ok(reply)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use confidential_data_hub::{
+        storage::{volume_type::blockdevice::error::BlockDeviceError, Error as StorageError},
+        Error as HubError,
+    };
+
+    #[test]
+    fn secure_mount_response_preserves_the_complete_error_chain() {
+        let error = HubError::SecureMount(StorageError::BlockDeviceError(
+            BlockDeviceError::Luks2Error {
+                source: anyhow!("cryptsetup reopen failed"),
+            },
+        ));
+        let detailed_error = format_error!(error);
+        let message = secure_mount_error_message(&detailed_error);
+
+        assert!(message.starts_with("[CDH] [ERROR]: Secure Mount failed"));
+        assert!(message.contains("Error when mounting Block device"));
+        assert!(message.contains("Error when doing luks2 operation"));
+        assert!(message.contains("cryptsetup reopen failed"));
     }
 }
 
