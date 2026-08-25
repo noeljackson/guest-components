@@ -39,6 +39,13 @@ IMAGE_SIZE_ALIGNMENT_MB="${IMAGE_SIZE_ALIGNMENT_MB:-128}"
 info() { echo "[build-erofs-image] $*"; }
 die() { echo "[build-erofs-image] ERROR: $*" >&2; exit 1; }
 
+has_executable_mode() {
+	local mode
+	[[ -f "$1" ]] || return 1
+	mode="$(stat -c '%a' -- "$1")" || return 1
+	(( (8#${mode} & 0111) != 0 ))
+}
+
 [[ -d "${ROOTFS_DIR}" ]] || die "rootfs not found at ${ROOTFS_DIR}; run assemble-rootfs.sh first"
 if [[ "${EUID}" -ne 0 ]]; then
 	command -v sudo >/dev/null 2>&1 || die "root privileges are required and sudo is not available"
@@ -62,13 +69,6 @@ cleanup() {
 	done
 }
 trap cleanup EXIT
-
-make_temp_dir() {
-	local dir
-	dir="$(mktemp -p "${TMPDIR:-/tmp}" -d coco-extension-image.XXXXXX)"
-	cleanup_paths+=("${dir}")
-	echo "${dir}"
-}
 
 make_erofs_payload() {
 	local staging_dir="$1"
@@ -196,15 +196,18 @@ setup_verity() {
 verify_erofs_payload() {
 	local device="$1"
 	local extracted_dir
+	local extracted_root
 	local expected_cdh="${ROOTFS_DIR}/usr/local/bin/confidential-data-hub"
 	local actual_cdh
 
-	[[ -f "${expected_cdh}" && -x "${expected_cdh}" ]] || \
+	has_executable_mode "${expected_cdh}" || \
 		die "assembled rootfs lacks executable confidential-data-hub"
-	extracted_dir="$(make_temp_dir)/rootfs"
+	extracted_root="$(mktemp -p "${TMPDIR:-/tmp}" -d coco-extension-image.XXXXXX)"
+	cleanup_paths+=("${extracted_root}")
+	extracted_dir="${extracted_root}/rootfs"
 	fsck.erofs --extract="${extracted_dir}" "${device}p1" >/dev/null
 	actual_cdh="${extracted_dir}/usr/local/bin/confidential-data-hub"
-	[[ -f "${actual_cdh}" && -x "${actual_cdh}" ]] || \
+	has_executable_mode "${actual_cdh}" || \
 		die "EROFS payload lacks executable confidential-data-hub"
 	cmp -s "${expected_cdh}" "${actual_cdh}" || \
 		die "EROFS confidential-data-hub differs from the assembled rootfs"
@@ -220,7 +223,8 @@ build_image() {
 	local device
 
 	mkdir -p "${OUTPUT_DIR}"
-	staging_dir="$(make_temp_dir)"
+	staging_dir="$(mktemp -p "${TMPDIR:-/tmp}" -d coco-extension-image.XXXXXX)"
+	cleanup_paths+=("${staging_dir}")
 	fs_image="$(mktemp -p "${TMPDIR:-/tmp}" coco-extension-erofs.XXXXXX)"
 	cleanup_paths+=("${fs_image}")
 
