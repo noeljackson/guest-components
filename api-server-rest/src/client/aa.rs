@@ -11,7 +11,7 @@ use protos::ttrpc::aa::attestation_agent::{
 use protos::ttrpc::aa::attestation_agent_ttrpc::AttestationAgentServiceClient;
 use serde::Deserialize;
 
-use crate::TTRPC_TIMEOUT;
+use crate::AA_TTRPC_TIMEOUT;
 use crate::client::ttrpc_client::CachedTtrpcClient;
 
 /// ROOT path for Confidential Data Hub API
@@ -55,7 +55,7 @@ impl AAClient {
                     ..Default::default()
                 };
                 client
-                    .get_token(ttrpc::context::with_timeout(TTRPC_TIMEOUT), &req)
+                    .get_token(ttrpc::context::with_timeout(AA_TTRPC_TIMEOUT), &req)
                     .await
             })
             .await?;
@@ -73,7 +73,7 @@ impl AAClient {
                 };
 
                 client
-                    .get_evidence(ttrpc::context::with_timeout(TTRPC_TIMEOUT), &req)
+                    .get_evidence(ttrpc::context::with_timeout(AA_TTRPC_TIMEOUT), &req)
                     .await
             })
             .await?;
@@ -90,7 +90,7 @@ impl AAClient {
                 };
 
                 client
-                    .get_additional_evidence(ttrpc::context::with_timeout(TTRPC_TIMEOUT), &req)
+                    .get_additional_evidence(ttrpc::context::with_timeout(AA_TTRPC_TIMEOUT), &req)
                     .await
             })
             .await?;
@@ -114,7 +114,10 @@ impl AAClient {
                 };
 
                 client
-                    .extend_runtime_measurement(ttrpc::context::with_timeout(TTRPC_TIMEOUT), &req)
+                    .extend_runtime_measurement(
+                        ttrpc::context::with_timeout(AA_TTRPC_TIMEOUT),
+                        &req,
+                    )
                     .await
             })
             .await?
@@ -144,7 +147,7 @@ impl AAClient {
                 };
 
                 client
-                    .get_tee_type(ttrpc::context::with_timeout(TTRPC_TIMEOUT), &req)
+                    .get_tee_type(ttrpc::context::with_timeout(AA_TTRPC_TIMEOUT), &req)
                     .await
             })
             .await?;
@@ -160,7 +163,7 @@ impl AAClient {
                 };
 
                 client
-                    .get_additional_tees(ttrpc::context::with_timeout(TTRPC_TIMEOUT), &req)
+                    .get_additional_tees(ttrpc::context::with_timeout(AA_TTRPC_TIMEOUT), &req)
                     .await
             })
             .await?;
