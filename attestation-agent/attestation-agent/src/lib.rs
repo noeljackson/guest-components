@@ -163,7 +163,7 @@ impl AttestationAgent {
     async fn get_token_inner(
         &self,
         token_type: &str,
-        request_timeout: Option<Duration>,
+        _request_timeout: Option<Duration>,
     ) -> Result<Vec<u8>> {
         let token_type = TokenType::from_str(token_type).context("Unsupported token type")?;
 
@@ -174,7 +174,7 @@ impl AttestationAgent {
                 let config = config.token_configs.kbs.as_ref().ok_or(anyhow::anyhow!(
                     "kbs token config not configured in config file"
                 ))?;
-                let getter = match request_timeout {
+                let getter = match _request_timeout {
                     Some(timeout) => {
                         token::kbs::KbsTokenGetter::new_with_request_timeout(config, timeout)
                     }
