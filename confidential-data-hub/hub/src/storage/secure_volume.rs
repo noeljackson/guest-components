@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use anyhow::anyhow;
 use resource_uri::{ResourcePluginPath, ResourceUri, DEFAULT_RESOURCE_PLUGIN};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -21,8 +22,9 @@ use crate::storage::{
 };
 
 const MAX_MANIFEST_SIZE: usize = 64 * 1024;
-const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 const SUPPORTED_PROTECTION_TYPE: &str = "luks2-integrity-rw";
+const SHA256_TAG_PREFIX: &str = "sha256-";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -33,6 +35,12 @@ pub enum Error {
 
     #[error("failed to parse secure-volume manifest: {0}")]
     ManifestParse(#[from] serde_json::Error),
+
+    #[error("secure-volume manifest digest does not match resource URI")]
+    ManifestDigestMismatch,
+
+    #[error("secure-volume recovery key digest does not match manifest")]
+    KeyDigestMismatch,
 
     #[error("invalid secure-volume manifest: {0}")]
     InvalidManifest(String),
@@ -92,11 +100,12 @@ pub struct Protection {
     #[serde(rename = "type")]
     pub protection_type: String,
     pub key_uri: String,
+    pub key_sha256: String,
     pub luks_uuid: String,
 }
 
 impl Manifest {
-    pub fn parse(bytes: &[u8]) -> Result<Self> {
+    fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > MAX_MANIFEST_SIZE {
             return Err(Error::ManifestTooLarge);
         }
@@ -104,6 +113,30 @@ impl Manifest {
         let manifest: Self = serde_json::from_slice(bytes)?;
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// Parse a manifest only after its exact bytes match the digest-addressed KBS URI.
+    pub fn parse_bound(bytes: &[u8], uri: &str) -> Result<Self> {
+        if bytes.len() > MAX_MANIFEST_SIZE {
+            return Err(Error::ManifestTooLarge);
+        }
+
+        let path = validate_kbs_resource_uri(uri)?;
+        let expected = path.tag.strip_prefix(SHA256_TAG_PREFIX).ok_or_else(|| {
+            Error::InvalidManifest(
+                "manifest resource tag must be sha256-<64 lowercase hex>".to_string(),
+            )
+        })?;
+        if !canonical_sha256(expected) {
+            return Err(Error::InvalidManifest(
+                "manifest resource tag must be sha256-<64 lowercase hex>".to_string(),
+            ));
+        }
+        if sha256_hex(bytes) != expected {
+            return Err(Error::ManifestDigestMismatch);
+        }
+
+        Self::parse(bytes)
     }
 
     fn validate(&self) -> Result<()> {
@@ -129,6 +162,11 @@ impl Manifest {
             )));
         }
         validate_kbs_resource_uri(&self.protection.key_uri)?;
+        if !canonical_sha256(&self.protection.key_sha256) {
+            return Err(Error::InvalidManifest(
+                "keySha256 must be 64 lowercase hexadecimal characters".to_string(),
+            ));
+        }
 
         let uuid = Uuid::parse_str(&self.protection.luks_uuid)
             .map_err(|error| Error::InvalidManifest(format!("invalid LUKS UUID: {error}")))?;
@@ -140,12 +178,10 @@ impl Manifest {
         Ok(())
     }
 
-    pub fn validate_manifest_uri(&self, uri: &str) -> Result<()> {
-        let path = validate_kbs_resource_uri(uri)?;
-        if path.tag != self.volume_version {
-            return Err(Error::InvalidManifest(
-                "manifest resource tag must equal volumeVersion".to_string(),
-            ));
+    /// Verify the recovery key before the device is resolved or mutated.
+    pub fn verify_key(&self, key: &[u8]) -> Result<()> {
+        if sha256_hex(key) != self.protection.key_sha256 {
+            return Err(Error::KeyDigestMismatch);
         }
         Ok(())
     }
@@ -162,6 +198,20 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,29 +402,76 @@ fn validate_identifier(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const MANIFEST_URI: &str = "kbs:///tenant/storage-manifests/volume-1-v1";
+    const KEY: &[u8] = b"test recovery key material";
 
     fn valid_manifest() -> Vec<u8> {
-        br#"{
-          "schemaVersion": 1,
+        format!(
+            r#"{{
+          "schemaVersion": 2,
           "volumeId": "tenant/workload/volume-1",
-          "volumeVersion": "volume-1-v1",
+          "volumeVersion": "volume-1-v2",
           "deviceSizeBytes": 1073741824,
           "access": "readWrite",
-          "protection": {
+          "protection": {{
             "type": "luks2-integrity-rw",
             "keyUri": "kbs:///tenant/storage-keys/volume-1-v1",
+            "keySha256": "{}",
             "luksUuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-          }
-        }"#
-        .to_vec()
+          }}
+        }}"#,
+            sha256_hex(KEY)
+        )
+        .into_bytes()
+    }
+
+    fn manifest_uri(bytes: &[u8]) -> String {
+        format!(
+            "kbs:///tenant/storage-manifests/{SHA256_TAG_PREFIX}{}",
+            sha256_hex(bytes)
+        )
     }
 
     #[test]
-    fn parses_supported_manifest_and_binds_resource_tag() {
-        let manifest = Manifest::parse(&valid_manifest()).unwrap();
-        manifest.validate_manifest_uri(MANIFEST_URI).unwrap();
+    fn parses_supported_manifest_and_binds_manifest_and_key_content() {
+        let bytes = valid_manifest();
+        let manifest = Manifest::parse_bound(&bytes, &manifest_uri(&bytes)).unwrap();
+        manifest.verify_key(KEY).unwrap();
         manifest.ensure_access(VolumeAccess::ReadWrite).unwrap();
+    }
+
+    #[test]
+    fn rejects_manifest_and_key_substitution() {
+        let bytes = valid_manifest();
+        let uri = manifest_uri(&bytes);
+        let substituted = String::from_utf8(bytes.clone())
+            .unwrap()
+            .replace("1073741824", "2147483648");
+        assert!(matches!(
+            Manifest::parse_bound(substituted.as_bytes(), &uri),
+            Err(Error::ManifestDigestMismatch)
+        ));
+
+        let manifest = Manifest::parse_bound(&bytes, &uri).unwrap();
+        assert!(matches!(
+            manifest.verify_key(b"substituted recovery key"),
+            Err(Error::KeyDigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_digest_manifest_aliases() {
+        let bytes = valid_manifest();
+        assert!(matches!(
+            Manifest::parse_bound(&bytes, "kbs:///tenant/storage-manifests/volume-1-v2"),
+            Err(Error::InvalidManifest(_))
+        ));
+        assert!(matches!(
+            Manifest::parse_bound(
+                &bytes,
+                "kbs:///tenant/storage-manifests/sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            Err(Error::InvalidManifest(_))
+        ));
     }
 
     #[test]
@@ -394,6 +491,18 @@ mod tests {
         let bytes = String::from_utf8(valid_manifest())
             .unwrap()
             .replace("luks2-integrity-rw", "luks2-rw");
+        assert!(matches!(
+            Manifest::parse(bytes.as_bytes()),
+            Err(Error::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_noncanonical_key_fingerprint() {
+        let bytes = String::from_utf8(valid_manifest()).unwrap().replace(
+            &sha256_hex(KEY),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
         assert!(matches!(
             Manifest::parse(bytes.as_bytes()),
             Err(Error::InvalidManifest(_))
@@ -425,10 +534,8 @@ mod tests {
 
     #[test]
     fn rejects_manifest_alias_and_access_mismatch() {
-        let manifest = Manifest::parse(&valid_manifest()).unwrap();
-        assert!(manifest
-            .validate_manifest_uri("kbs:///tenant/storage-manifests/latest")
-            .is_err());
+        let bytes = valid_manifest();
+        let manifest = Manifest::parse_bound(&bytes, &manifest_uri(&bytes)).unwrap();
         assert!(matches!(
             manifest.ensure_access(VolumeAccess::ReadOnly),
             Err(Error::AccessMismatch { .. })
