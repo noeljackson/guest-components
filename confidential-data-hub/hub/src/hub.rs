@@ -108,12 +108,12 @@ impl DataHub for Hub {
 
         validate_kbs_resource_uri(manifest_uri)?;
         let manifest_bytes = self.get_resource(manifest_uri.to_string()).await?;
-        let manifest = Manifest::parse(&manifest_bytes)?;
-        manifest.validate_manifest_uri(manifest_uri)?;
+        let manifest = Manifest::parse_bound(&manifest_bytes, manifest_uri)?;
         manifest.ensure_access(requested_access)?;
         let key = self
             .get_resource(manifest.protection.key_uri.clone())
             .await?;
+        manifest.verify_key(&key)?;
         self.secure_volumes
             .activate(device_id, &manifest, requested_access, Zeroizing::new(key))
             .await
