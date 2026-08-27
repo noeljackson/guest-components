@@ -37,6 +37,14 @@ pub enum Error {
     #[error("Secure Volume failed")]
     SecureVolume(#[from] storage::secure_volume::Error),
 
+    #[error("Secure Volume {stage} failed")]
+    SecureVolumeResource {
+        stage: &'static str,
+        reason: &'static str,
+        #[source]
+        source: Box<Error>,
+    },
+
     #[error("Image Pull error: {0}")]
     ImagePull(#[from] image_rs::image::PullImageError),
 
@@ -48,6 +56,25 @@ pub enum Error {
         #[source]
         source: anyhow::Error,
     },
+}
+
+impl Error {
+    pub fn secure_volume_failure(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::SecureVolume(error) => Some(error.failure_code()),
+            Self::SecureVolumeResource { stage, reason, .. } => Some((stage, reason)),
+            _ => None,
+        }
+    }
+
+    pub fn secure_volume_status_message(&self) -> String {
+        match self.secure_volume_failure() {
+            Some((stage, reason)) => format!(
+                "[CDH] [ERROR]: secure volume activation failed; stage={stage}; reason={reason}"
+            ),
+            None => format!("[CDH] [ERROR]: {self}"),
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -94,5 +121,36 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Failed to unpack layer to destination"));
         assert!(message.contains(&source_message));
+    }
+
+    #[test]
+    fn secure_volume_status_is_bounded_and_stage_specific() {
+        let error = Error::SecureVolume(storage::secure_volume::Error::AccessMismatch {
+            requested: storage::secure_volume::VolumeAccess::ReadOnly,
+            manifest: storage::secure_volume::VolumeAccess::ReadWrite,
+        });
+
+        assert_eq!(
+            error.secure_volume_status_message(),
+            "[CDH] [ERROR]: secure volume activation failed; stage=access_validation; reason=mismatch"
+        );
+    }
+
+    #[test]
+    fn secure_volume_resource_status_omits_provider_detail() {
+        let error = Error::SecureVolumeResource {
+            stage: "key_fetch",
+            reason: "client_initialization",
+            source: Box::new(Error::KbsClient {
+                source: kms::Error::KbsClientError("sensitive provider detail".into()),
+            }),
+        };
+
+        let status = error.secure_volume_status_message();
+        assert_eq!(
+            status,
+            "[CDH] [ERROR]: secure volume activation failed; stage=key_fetch; reason=client_initialization"
+        );
+        assert!(!status.contains("sensitive provider detail"));
     }
 }

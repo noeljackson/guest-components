@@ -67,6 +67,24 @@ pub enum Error {
     Activation(#[source] anyhow::Error),
 }
 
+impl Error {
+    pub fn failure_code(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::ManifestTooLarge => ("manifest_validation", "too_large"),
+            Self::ManifestParse(_) => ("manifest_validation", "invalid_json"),
+            Self::ManifestDigestMismatch => ("manifest_validation", "digest_mismatch"),
+            Self::KeyDigestMismatch => ("key_validation", "digest_mismatch"),
+            Self::InvalidManifest(_) => ("manifest_validation", "invalid_manifest"),
+            Self::InvalidDevice(_) => ("device_resolution", "invalid_device"),
+            Self::AccessMismatch { .. } => ("access_validation", "mismatch"),
+            Self::UnsupportedAccess(_) => ("access_validation", "unsupported"),
+            Self::DuplicateDevice(_) => ("activation", "duplicate_device"),
+            Self::DuplicateVolume(_) => ("activation", "duplicate_volume"),
+            Self::Activation(_) => ("activation", "device_setup"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum VolumeAccess {
