@@ -24,10 +24,66 @@ use protos::ttrpc::aa::attestation_agent_ttrpc::AttestationAgentServiceClient;
 use crate::storage::volume_type::Storage;
 use crate::{image, secret, CdhConfig, DataHub, Error, Result};
 
+struct ResourceClient {
+    inner: OnceCell<Box<dyn kms::Getter>>,
+}
+
+impl ResourceClient {
+    const fn new() -> Self {
+        Self {
+            inner: OnceCell::const_new(),
+        }
+    }
+
+    async fn get(&self, uri: &str) -> Result<Vec<u8>> {
+        // Provider settings are not required for the in-guest KBS client. Keep
+        // the client for the Hub lifetime: it owns only the attested session,
+        // while each returned resource remains scoped to this call.
+        let client = self
+            .inner
+            .get_or_try_init(|| async {
+                kms::new_getter("kbs", ProviderSettings::default())
+                    .await
+                    .map_err(|e| Error::KbsClient { source: e })
+            })
+            .await?;
+
+        client
+            .get_secret(uri, &Annotations::default())
+            .await
+            .map_err(|e| Error::GetResource { source: e })
+    }
+
+    #[cfg(test)]
+    fn with_client(client: Box<dyn kms::Getter>) -> Self {
+        Self {
+            inner: OnceCell::new_with(Some(client)),
+        }
+    }
+}
+
+fn secure_volume_resource_error(stage: &'static str, source: Error) -> Error {
+    let reason = match &source {
+        Error::KbsClient { .. } => "client_initialization",
+        Error::GetResource { .. } => "resource_request",
+        _ => "unexpected",
+    };
+    Error::SecureVolumeResource {
+        stage,
+        reason,
+        source: Box::new(source),
+    }
+}
+
 pub struct Hub {
     #[allow(dead_code)]
     pub(crate) credentials: HashMap<String, String>,
     image_client: OnceCell<Mutex<ImageClient>>,
+    // A secure-volume activation reads a content-bound manifest and then its
+    // recovery key. Reuse one guest-scoped KBS client so both reads share the
+    // same attested token and TEE keypair instead of performing a second
+    // attestation in the middle of one activation transaction.
+    resource_client: ResourceClient,
     #[cfg(feature = "ttrpc")]
     aa_client: OnceCell<Option<AttestationAgentServiceClient>>,
     config: CdhConfig,
@@ -49,6 +105,7 @@ impl Hub {
             credentials,
             config,
             image_client: OnceCell::const_new(),
+            resource_client: ResourceClient::new(),
             #[cfg(feature = "ttrpc")]
             aa_client: OnceCell::const_new(),
             secure_volumes: crate::storage::secure_volume::Manager::default(),
@@ -78,17 +135,7 @@ impl DataHub for Hub {
 
     async fn get_resource(&self, uri: String) -> Result<Vec<u8>> {
         info!("get resource called: {uri}");
-        // to initialize a get_resource_provider client we do not need the ProviderSettings.
-        let client = kms::new_getter("kbs", ProviderSettings::default())
-            .await
-            .map_err(|e| Error::KbsClient { source: e })?;
-
-        // to get resource using a get_resource_provider client we do not need the Annotations.
-        let res = client
-            .get_secret(&uri, &Annotations::default())
-            .await
-            .map_err(|e| Error::GetResource { source: e })?;
-        Ok(res)
+        self.resource_client.get(&uri).await
     }
 
     async fn secure_mount(&self, storage: Storage) -> Result<String> {
@@ -107,12 +154,16 @@ impl DataHub for Hub {
         use zeroize::Zeroizing;
 
         validate_kbs_resource_uri(manifest_uri)?;
-        let manifest_bytes = self.get_resource(manifest_uri.to_string()).await?;
+        let manifest_bytes = self
+            .get_resource(manifest_uri.to_string())
+            .await
+            .map_err(|error| secure_volume_resource_error("manifest_fetch", error))?;
         let manifest = Manifest::parse_bound(&manifest_bytes, manifest_uri)?;
         manifest.ensure_access(requested_access)?;
         let key = self
             .get_resource(manifest.protection.key_uri.clone())
-            .await?;
+            .await
+            .map_err(|error| secure_volume_resource_error("key_fetch", error))?;
         manifest.verify_key(&key)?;
         self.secure_volumes
             .activate(device_id, &manifest, requested_access, Zeroizing::new(key))
@@ -232,4 +283,45 @@ async fn initialize_aa_client(aa_socket: &str) -> Result<Option<AttestationAgent
         })?;
     let client = AttestationAgentServiceClient::new(c);
     Ok(Some(client))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    struct StatefulGetter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl kms::Getter for StatefulGetter {
+        async fn get_secret(
+            &self,
+            _name: &str,
+            _annotations: &Annotations,
+        ) -> kms::Result<Vec<u8>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(call.to_string().into_bytes())
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_client_reuses_one_attested_session() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = ResourceClient::with_client(Box::new(StatefulGetter {
+            calls: calls.clone(),
+        }));
+
+        assert_eq!(
+            client.get("kbs:///default/manifests/one").await.unwrap(),
+            b"1"
+        );
+        assert_eq!(client.get("kbs:///default/keys/one").await.unwrap(), b"2");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }
