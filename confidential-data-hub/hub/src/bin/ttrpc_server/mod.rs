@@ -248,7 +248,7 @@ impl SecureVolumeService for Server {
                 error!("[ttRPC CDH] Activate Volume:\n{detailed_error}");
                 let mut status = Status::new();
                 status.set_code(Code::INTERNAL);
-                status.set_message(format!("[CDH] [ERROR]: {e}"));
+                status.set_message(e.secure_volume_status_message());
                 Error::RpcStatus(status)
             })?;
 

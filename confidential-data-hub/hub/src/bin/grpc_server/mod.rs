@@ -151,7 +151,7 @@ impl SecureVolumeService for Cdh {
             .map_err(|e| {
                 let detailed_error = format_error!(e);
                 error!("[gRPC CDH] Activate Volume failed:\n{detailed_error}");
-                Status::internal(format!("[CDH] [ERROR]: {e}"))
+                Status::internal(e.secure_volume_status_message())
             })?;
 
         std::result::Result::Ok(Response::new(ActivateVolumeResponse {
