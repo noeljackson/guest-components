@@ -18,7 +18,7 @@ schema_version = 1
 [[process]]
 id            = "attestation-agent"
 level         = 1
-args          = ["--attestation_sock", "${aa_attestation_uri}"]
+args          = ["--attestation_sock", "${aa_attestation_uri}", "--require-initdata-binding"]
 optional_args = [{ when = "initdata_toml_path", args = ["--initdata-toml", "${initdata_toml_path}"] }]
 config        = "${aa_config_path}"
 wait_socket   = "${aa_attestation_socket}"
