@@ -1703,15 +1703,16 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     VolumeAccess\x12\x1d\n\x19VOLUME_ACCESS_UNSPECIFIED\x10\0\x12\x1b\n\x17V\
     OLUME_ACCESS_READ_ONLY\x10\x01\x12\x1c\n\x18VOLUME_ACCESS_READ_WRITE\x10\
     \x022V\n\x13SealedSecretService\x12?\n\x0cUnsealSecret\x12\x16.api.Unsea\
-    lSecretInput\x1a\x17.api.UnsealSecretOutput2V\n\x12GetResourceService\
-    \x12@\n\x0bGetResource\x12\x17.api.GetResourceRequest\x1a\x18.api.GetRes\
-    ourceResponse2V\n\x12SecureMountService\x12@\n\x0bSecureMount\x12\x17.ap\
-    i.SecureMountRequest\x1a\x18.api.SecureMountResponse2\xb1\x01\n\x13Secur\
-    eVolumeService\x12I\n\x0eActivateVolume\x12\x1a.api.ActivateVolumeReques\
-    t\x1a\x1b.api.ActivateVolumeResponse\x12O\n\x10DeactivateVolume\x12\x1c.\
-    api.DeactivateVolumeRequest\x1a\x1d.api.DeactivateVolumeResponse2N\n\x10\
-    ImagePullService\x12:\n\tPullImage\x12\x15.api.ImagePullRequest\x1a\x16.\
-    api.ImagePullResponseb\x06proto3\
+    lSecretInput\x1a\x17.api.UnsealSecretOutput2\x9e\x01\n\x12GetResourceSer\
+    vice\x12@\n\x0bGetResource\x12\x17.api.GetResourceRequest\x1a\x18.api.Ge\
+    tResourceResponse\x12F\n\x11GetPublicResource\x12\x17.api.GetResourceReq\
+    uest\x1a\x18.api.GetResourceResponse2V\n\x12SecureMountService\x12@\n\
+    \x0bSecureMount\x12\x17.api.SecureMountRequest\x1a\x18.api.SecureMountRe\
+    sponse2\xb1\x01\n\x13SecureVolumeService\x12I\n\x0eActivateVolume\x12\
+    \x1a.api.ActivateVolumeRequest\x1a\x1b.api.ActivateVolumeResponse\x12O\n\
+    \x10DeactivateVolume\x12\x1c.api.DeactivateVolumeRequest\x1a\x1d.api.Dea\
+    ctivateVolumeResponse2N\n\x10ImagePullService\x12:\n\tPullImage\x12\x15.\
+    api.ImagePullRequest\x1a\x16.api.ImagePullResponseb\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

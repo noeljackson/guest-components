@@ -99,6 +99,36 @@ impl GetResourceService for Server {
         debug!("[ttRPC CDH] send back the resource");
         Ok(reply)
     }
+
+    async fn get_public_resource(
+        &self,
+        _ctx: &TtrpcContext,
+        req: GetResourceRequest,
+    ) -> ::ttrpc::Result<GetResourceResponse> {
+        debug!("[ttRPC CDH] get new GetPublicResource request");
+        let resource = self
+            .hub
+            .get_public_resource(req.ResourcePath)
+            .await
+            .map_err(|e| {
+                let mut status = Status::new();
+                if matches!(e, confidential_data_hub::Error::PublicResourceDenied) {
+                    status.set_code(Code::PERMISSION_DENIED);
+                    status.set_message("[CDH] [ERROR]: public resource access denied".to_string());
+                } else {
+                    let detailed_error = format_error!(e);
+                    error!("[ttRPC CDH] GetPublicResource :\n{detailed_error}");
+                    status.set_code(Code::INTERNAL);
+                    status.set_message(format!("[CDH] [ERROR]: {e}"));
+                }
+                Error::RpcStatus(status)
+            })?;
+
+        let mut reply = GetResourceResponse::new();
+        reply.Resource = resource;
+        debug!("[ttRPC CDH] send back the public resource");
+        Ok(reply)
+    }
 }
 
 #[async_trait]

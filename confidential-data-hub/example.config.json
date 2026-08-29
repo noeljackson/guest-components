@@ -1,5 +1,6 @@
 {
     "socket": "unix:///run/confidential-containers/cdh.sock",
+    "protected_resource_uri_prefixes": [],
     "aa": {
         "aa_socket": "unix:///run/confidential-containers/attestation-agent/attestation-agent.sock"
     },

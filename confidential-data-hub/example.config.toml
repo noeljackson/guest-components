@@ -1,5 +1,8 @@
 # The ttrpc sock of CDH that is used to listen to the requests
 socket = "unix:///run/confidential-containers/cdh.sock"
+# Workload-facing resource APIs refuse these canonical local KBS namespaces.
+# Internal Agent and secure-volume operations continue to use the private CDH API.
+protected_resource_uri_prefixes = []
 
 [aa]
 aa_socket = "unix:///run/confidential-containers/attestation-agent/attestation-agent.sock"
