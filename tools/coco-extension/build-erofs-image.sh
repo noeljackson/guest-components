@@ -52,7 +52,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 	exec sudo -E bash "$0" "$@"
 fi
 
-for cmd in cmp cp dd fsck.erofs losetup mkfs.erofs parted partprobe sed stat truncate veritysetup; do
+for cmd in cmp cp dd fsck.erofs losetup mkfs.erofs parted partprobe sed stat truncate udevadm veritysetup; do
 	command -v "${cmd}" >/dev/null 2>&1 || die "${cmd} is required"
 done
 
@@ -134,17 +134,23 @@ attach_loop_device() {
 	local device
 
 	device="$(losetup -P -f --show "${image}")"
+	# Own the loop device as soon as losetup succeeds. A partition-discovery
+	# timeout must still detach it through the EXIT trap.
+	loop_device="${device}"
 	partprobe -s "${device}" >/dev/null
+	# Partition device nodes are created asynchronously by udev and can lag
+	# behind partprobe on a busy host. Wait for the second (last) partition,
+	# then retain a bounded poll as a fallback for delayed device-node creation.
+	udevadm settle --timeout=30 --exit-if-exists="${device}p2" || true
 
-	for _ in $(seq 1 5); do
-		if [[ -b "${device}p1" ]]; then
-			loop_device="${device}"
+	for _ in $(seq 1 30); do
+		if [[ -b "${device}p1" && -b "${device}p2" ]]; then
 			return
 		fi
 		sleep 1
 	done
 
-	die "partition ${device}p1 was not created"
+	die "partitions ${device}p1 and ${device}p2 were not created"
 }
 
 build_kernel_verity_params() {
