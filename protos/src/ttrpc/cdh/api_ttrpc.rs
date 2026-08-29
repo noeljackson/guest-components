@@ -83,6 +83,11 @@ impl GetResourceServiceClient {
         let mut cres = super::api::GetResourceResponse::new();
         ::ttrpc::async_client_request!(self, ctx, req, "api.GetResourceService", "GetResource", cres);
     }
+
+    pub async fn get_public_resource(&self, ctx: ttrpc::context::Context, req: &super::api::GetResourceRequest) -> ::ttrpc::Result<super::api::GetResourceResponse> {
+        let mut cres = super::api::GetResourceResponse::new();
+        ::ttrpc::async_client_request!(self, ctx, req, "api.GetResourceService", "GetPublicResource", cres);
+    }
 }
 
 struct GetResourceMethod {
@@ -96,10 +101,24 @@ impl ::ttrpc::r#async::MethodHandler for GetResourceMethod {
     }
 }
 
+struct GetPublicResourceMethod {
+    service: Arc<dyn GetResourceService + Send + Sync>,
+}
+
+#[async_trait]
+impl ::ttrpc::r#async::MethodHandler for GetPublicResourceMethod {
+    async fn handler(&self, ctx: ::ttrpc::r#async::TtrpcContext, req: ::ttrpc::Request) -> ::ttrpc::Result<::ttrpc::Response> {
+        ::ttrpc::async_request_handler!(self, ctx, req, api, GetResourceRequest, get_public_resource);
+    }
+}
+
 #[async_trait]
 pub trait GetResourceService: Sync {
     async fn get_resource(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::api::GetResourceRequest) -> ::ttrpc::Result<super::api::GetResourceResponse> {
         Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/api.GetResourceService/GetResource is not supported".to_string())))
+    }
+    async fn get_public_resource(&self, _ctx: &::ttrpc::r#async::TtrpcContext, _: super::api::GetResourceRequest) -> ::ttrpc::Result<super::api::GetResourceResponse> {
+        Err(::ttrpc::Error::RpcStatus(::ttrpc::get_status(::ttrpc::Code::NOT_FOUND, "/api.GetResourceService/GetPublicResource is not supported".to_string())))
     }
 }
 
@@ -110,6 +129,9 @@ pub fn create_get_resource_service(service: Arc<dyn GetResourceService + Send + 
 
     methods.insert("GetResource".to_string(),
                     Box::new(GetResourceMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
+
+    methods.insert("GetPublicResource".to_string(),
+                    Box::new(GetPublicResourceMethod{service: service.clone()}) as Box<dyn ::ttrpc::r#async::MethodHandler + Send + Sync>);
 
     ret.insert("api.GetResourceService".to_string(), ::ttrpc::r#async::Service{ methods, streams });
     ret

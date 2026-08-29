@@ -47,7 +47,7 @@ impl CDHClient {
                     };
 
                     client
-                        .get_resource(request_context(self.request_timeout), &req)
+                        .get_public_resource(request_context(self.request_timeout), &req)
                         .await
                 }
             })
