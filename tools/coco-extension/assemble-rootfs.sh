@@ -78,6 +78,11 @@ build_dir="${repo_root_dir}/target/${rust_arch}-unknown-linux-${LIBC}/release"
 build_guest_components() {
 	info "Building guest components (ARCH=${ARCH} LIBC=${LIBC} ATTESTER=${ATTESTER})"
 
+	# The NVIDIA variant is built into this same Cargo output path later.  A
+	# repeated assembly must not let that existing feature-expanded binary
+	# satisfy the stock Make target.
+	rm -f "${build_dir}/attestation-agent"
+
 	make -C "${repo_root_dir}" build \
 		TEE_PLATFORM="${TEE_PLATFORM}" \
 		ARCH="${ARCH}" \
@@ -91,6 +96,31 @@ build_guest_components() {
 	for bin in confidential-data-hub attestation-agent api-server-rest; do
 		"${strip_bin}" "${build_dir}/${bin}"
 	done
+}
+
+binary_needs_library() {
+	local binary="$1"
+	local library_prefix="$2"
+
+	readelf -d "${binary}" | grep -Fq "Shared library: [${library_prefix}"
+}
+
+verify_attestation_agent_variant() {
+	local binary="$1"
+	local variant="$2"
+
+	case "${variant}" in
+		stock)
+			if binary_needs_library "${binary}" "libnvat.so"; then
+				die "stock attestation-agent unexpectedly links libnvat"
+			fi
+			;;
+		nvidia)
+			binary_needs_library "${binary}" "libnvat.so" || \
+				die "NVIDIA attestation-agent does not link libnvat"
+			;;
+		*) die "unsupported attestation-agent variant check: ${variant}" ;;
+	esac
 }
 
 copy_non_glibc_library_closure() {
@@ -155,6 +185,8 @@ build_nvidia_attestation_agent() {
 	install -D -m0755 \
 		"${build_dir}/attestation-agent" \
 		"${ROOTFS_DIR}/usr/local/bin/attestation-agent-nv"
+	verify_attestation_agent_variant \
+		"${ROOTFS_DIR}/usr/local/bin/attestation-agent-nv" nvidia
 
 	info "Installing NVIDIA attestation libraries"
 	mkdir -p "${ROOTFS_DIR}/usr/local/lib"
@@ -187,6 +219,8 @@ install_guest_components() {
 		ARCH="${ARCH}" \
 		LIBC="${LIBC}" \
 		DESTDIR="${ROOTFS_DIR}/usr/local/bin"
+	verify_attestation_agent_variant \
+		"${ROOTFS_DIR}/usr/local/bin/attestation-agent" stock
 
 	# ocicrypt config used by CDH's keyprovider; referenced from components.toml.
 	install -D -m0644 \
