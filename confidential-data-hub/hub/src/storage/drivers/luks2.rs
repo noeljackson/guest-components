@@ -53,6 +53,17 @@ const HMAC_SHA256: &str = "hmac-sha256";
 const HMAC_SHA256_STATUS: &str = "hmac(sha256)";
 
 const SECTOR_SIZE: u32 = 4096;
+const PERSISTENT_LUKS_KEY_BITS: &str = "512";
+const PERSISTENT_LUKS_KEY_BYTES: u64 = 64;
+const PERSISTENT_PBKDF: &str = "pbkdf2";
+const PERSISTENT_PBKDF_HASH: &str = "sha256";
+const PERSISTENT_PBKDF_ITERATIONS: &str = "100000";
+const PERSISTENT_KEYFILE_BYTES: &str = "32";
+const PERSISTENT_DIGEST_ITERATIONS: u64 = 1000;
+const PERSISTENT_AF_STRIPES: u64 = 4000;
+const PERSISTENT_JSON_AREA_BYTES: u64 = PERSISTENT_LUKS2_METADATA_AREA_BYTES - 4096;
+const PERSISTENT_KEYSLOT_AREA_OFFSET_BYTES: &str = "32768";
+const PERSISTENT_KEYSLOT_AREA_BYTES: &str = "258048";
 
 const CRYPTSETUP_BIN: &str = "cryptsetup";
 const BLKID_BIN: &str = "blkid";
@@ -62,8 +73,8 @@ pub const LUKS_HEADER_FILE_SUFFIX: &str = ".header";
 pub const LUKS2_HEADER_MIN_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 
 const PERSISTENT_VOLUME_ID_MAX_BYTES: usize = 256;
-const PERSISTENT_KEY_MIN_BYTES: usize = 32;
-const PERSISTENT_KEY_MAX_BYTES: usize = 4096;
+pub(crate) const PERSISTENT_KEY_BYTES: usize = 32;
+pub(crate) const PERSISTENT_PROFILE_VERSION: u32 = 1;
 const PERSISTENT_MAPPER_PREFIX: &str = "coco-pv-";
 const ZERO_SCAN_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 // First-use verification is deliberately a complete-device scan. Keep its
@@ -75,7 +86,7 @@ const ZERO_SCAN_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024 * 1024;
 // unavailable before the mapper opens. Fix the LUKS2 header at 16 MiB and move
 // the payload by 8 KiB, leaving room for two crash-tolerant state records.
 const PERSISTENT_METADATA_MAGIC: &[u8; 8] = b"COCOPV\0\0";
-const PERSISTENT_METADATA_VERSION: u16 = 1;
+const PERSISTENT_METADATA_VERSION: u16 = 2;
 const PERSISTENT_METADATA_SLOT_BYTES: usize = 4096;
 const PERSISTENT_METADATA_SLOT_COUNT: usize = 2;
 const PERSISTENT_HEADER_BYTES: usize = LUKS2_HEADER_MIN_SIZE_BYTES as usize;
@@ -86,11 +97,17 @@ const PERSISTENT_METADATA_OFFSET_BYTES: u64 = LUKS2_HEADER_MIN_SIZE_BYTES;
 const PERSISTENT_DATA_OFFSET_BYTES: u64 = PERSISTENT_METADATA_OFFSET_BYTES
     + (PERSISTENT_METADATA_SLOT_BYTES * PERSISTENT_METADATA_SLOT_COUNT) as u64;
 const PERSISTENT_DATA_OFFSET_SECTORS: u64 = PERSISTENT_DATA_OFFSET_BYTES / 512;
-const PERSISTENT_RECORD_MAC_OFFSET: usize = 84;
+const PERSISTENT_VOLUME_ID_DIGEST_OFFSET: usize = 20;
+const PERSISTENT_VOLUME_VERSION_DIGEST_OFFSET: usize = 52;
+const PERSISTENT_MANIFEST_DIGEST_OFFSET: usize = 84;
+const PERSISTENT_PROFILE_VERSION_OFFSET: usize = 116;
+const PERSISTENT_PROFILE_RESERVED_OFFSET: usize = 120;
+const PERSISTENT_HEADER_MAC_OFFSET: usize = 124;
+const PERSISTENT_RECORD_MAC_OFFSET: usize = 156;
 const PERSISTENT_RECORD_MAC_BYTES: usize = 32;
-const PERSISTENT_HEADER_MAC_DOMAIN: &[u8] = b"coco-cdh-persistent-luks2-header-v1";
-const PERSISTENT_RECORD_MAC_DOMAIN: &[u8] = b"coco-cdh-persistent-luks2-record-v1";
-const PERSISTENT_AUTH_KEY_DOMAIN: &[u8] = b"coco-cdh-persistent-luks2-auth-key-v1";
+const PERSISTENT_HEADER_MAC_DOMAIN: &[u8] = b"coco-cdh-persistent-luks2-header-v2";
+const PERSISTENT_RECORD_MAC_DOMAIN: &[u8] = b"coco-cdh-persistent-luks2-record-v2";
+const PERSISTENT_AUTH_KEY_DOMAIN: &[u8] = b"coco-cdh-persistent-luks2-auth-key-v2";
 const BLKGETSIZE64: libc::Ioctl = 0x8008_1272u32 as libc::Ioctl;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -132,6 +149,50 @@ impl PersistentVolumeId {
     }
 }
 
+/// The complete measured identity authorized to activate one persistent volume.
+///
+/// Only the typed SecureVolumeService can construct this value. The digests are
+/// stored in authenticated metadata and also cover the detached LUKS2 header,
+/// preventing a valid header or disk record from being reopened under a
+/// different manifest, volume generation, or crypto profile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PersistentVolumeBinding {
+    volume_id: PersistentVolumeId,
+    volume_version_digest: [u8; 32],
+    manifest_digest: [u8; 32],
+    profile_version: u32,
+}
+
+impl PersistentVolumeBinding {
+    pub(crate) fn new(
+        volume_id: PersistentVolumeId,
+        volume_version: &str,
+        manifest_digest: [u8; 32],
+        profile_version: u32,
+    ) -> Result<Self> {
+        if profile_version != PERSISTENT_PROFILE_VERSION {
+            bail!("persistent LUKS2 profile version is not supported")
+        }
+        Ok(Self {
+            volume_id,
+            volume_version_digest: Sha256::digest(volume_version.as_bytes()).into(),
+            manifest_digest,
+            profile_version,
+        })
+    }
+
+    fn mapper_name(&self) -> String {
+        self.volume_id.mapper_name()
+    }
+
+    fn update_hmac(&self, mac: &mut HmacSha256) {
+        mac.update(&self.volume_id.digest());
+        mac.update(&self.volume_version_digest);
+        mac.update(&self.manifest_digest);
+        mac.update(&self.profile_version.to_be_bytes());
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FilesystemProbe {
     Unformatted,
@@ -153,9 +214,111 @@ enum PersistentLuksState {
 }
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-struct DeviceNumber {
+pub(crate) struct DeviceNumber {
     major: u64,
     minor: u64,
+}
+
+impl DeviceNumber {
+    pub(crate) fn new(major: u64, minor: u64) -> Self {
+        Self { major, minor }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockDeviceIdentity {
+    number: DeviceNumber,
+    filesystem_device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistentPathOperation {
+    Format,
+    ReadUuid,
+    ReadProfile,
+    VerifyKey,
+    Open,
+}
+
+impl PersistentPathOperation {
+    #[cfg(test)]
+    const ALL: [Self; 5] = [
+        Self::Format,
+        Self::ReadUuid,
+        Self::ReadProfile,
+        Self::VerifyKey,
+        Self::Open,
+    ];
+}
+
+fn checked_path_operation<T, Identity, Operation>(
+    expected: BlockDeviceIdentity,
+    boundary: PersistentPathOperation,
+    mut current_identity: Identity,
+    operation: Operation,
+) -> Result<T>
+where
+    Identity: FnMut() -> Result<BlockDeviceIdentity>,
+    Operation: FnOnce() -> Result<T>,
+{
+    let before = current_identity()
+        .with_context(|| format!("verify device identity before {boundary:?}"))?;
+    if before != expected {
+        bail!("persistent block-device identity changed before {boundary:?}")
+    }
+
+    let result = operation();
+    let after =
+        current_identity().with_context(|| format!("verify device identity after {boundary:?}"))?;
+    if after != expected {
+        bail!("persistent block-device identity changed during {boundary:?}")
+    }
+    result
+}
+
+struct PinnedPersistentDevice {
+    path: String,
+    file: File,
+    identity: BlockDeviceIdentity,
+}
+
+impl PinnedPersistentDevice {
+    fn open(path: &str, expected: DeviceNumber) -> Result<Self> {
+        let file = open_persistent_device(path)?;
+        let identity = block_device_identity_from_metadata(
+            &file
+                .metadata()
+                .with_context(|| format!("inspect opened persistent block device {path}"))?,
+            path,
+        )?;
+        if identity.number != expected {
+            bail!("opened persistent block device does not match the requested device ID")
+        }
+        let pinned = Self {
+            path: path.to_string(),
+            file,
+            identity,
+        };
+        pinned.verify_path()?;
+        Ok(pinned)
+    }
+
+    fn verify_path(&self) -> Result<BlockDeviceIdentity> {
+        let identity = block_device_identity(&self.path)?;
+        if identity != self.identity {
+            bail!("persistent block-device path no longer names the opened device")
+        }
+        Ok(identity)
+    }
+
+    fn run_path_operation<T>(
+        &self,
+        boundary: PersistentPathOperation,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        checked_path_operation(self.identity, boundary, || self.verify_path(), operation)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,15 +326,21 @@ struct PersistentMetadataRecord {
     state: PersistentLuksState,
     sequence: u64,
     volume_id_digest: [u8; 32],
+    volume_version_digest: [u8; 32],
+    manifest_digest: [u8; 32],
+    profile_version: u32,
     header_mac: [u8; 32],
 }
 
 impl PersistentMetadataRecord {
-    fn prepared(volume_id: &PersistentVolumeId) -> Self {
+    fn prepared(binding: &PersistentVolumeBinding) -> Self {
         Self {
             state: PersistentLuksState::Prepared,
             sequence: 1,
-            volume_id_digest: volume_id.digest(),
+            volume_id_digest: binding.volume_id.digest(),
+            volume_version_digest: binding.volume_version_digest,
+            manifest_digest: binding.manifest_digest,
+            profile_version: binding.profile_version,
             header_mac: [0; 32],
         }
     }
@@ -186,8 +355,16 @@ impl PersistentMetadataRecord {
             PersistentLuksState::Ready => 3,
         };
         bytes[12..20].copy_from_slice(&self.sequence.to_be_bytes());
-        bytes[20..52].copy_from_slice(&self.volume_id_digest);
-        bytes[52..84].copy_from_slice(&self.header_mac);
+        bytes[PERSISTENT_VOLUME_ID_DIGEST_OFFSET..PERSISTENT_VOLUME_VERSION_DIGEST_OFFSET]
+            .copy_from_slice(&self.volume_id_digest);
+        bytes[PERSISTENT_VOLUME_VERSION_DIGEST_OFFSET..PERSISTENT_MANIFEST_DIGEST_OFFSET]
+            .copy_from_slice(&self.volume_version_digest);
+        bytes[PERSISTENT_MANIFEST_DIGEST_OFFSET..PERSISTENT_PROFILE_VERSION_OFFSET]
+            .copy_from_slice(&self.manifest_digest);
+        bytes[PERSISTENT_PROFILE_VERSION_OFFSET..PERSISTENT_PROFILE_RESERVED_OFFSET]
+            .copy_from_slice(&self.profile_version.to_be_bytes());
+        bytes[PERSISTENT_HEADER_MAC_OFFSET..PERSISTENT_RECORD_MAC_OFFSET]
+            .copy_from_slice(&self.header_mac);
 
         let mac = compute_hmac(auth_key, PERSISTENT_RECORD_MAC_DOMAIN, &[&bytes])?;
         bytes[PERSISTENT_RECORD_MAC_OFFSET
@@ -199,7 +376,7 @@ impl PersistentMetadataRecord {
     fn decode(
         mut bytes: [u8; PERSISTENT_METADATA_SLOT_BYTES],
         auth_key: &[u8],
-        volume_id: &PersistentVolumeId,
+        binding: &PersistentVolumeBinding,
     ) -> Result<Option<Self>> {
         if bytes.iter().all(|byte| *byte == 0) {
             return Ok(None);
@@ -211,6 +388,9 @@ impl PersistentMetadataRecord {
             bail!("persistent LUKS2 metadata version is not supported")
         }
         if bytes[11] != 0
+            || bytes[PERSISTENT_PROFILE_RESERVED_OFFSET..PERSISTENT_HEADER_MAC_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
             || bytes[PERSISTENT_RECORD_MAC_OFFSET + PERSISTENT_RECORD_MAC_BYTES..]
                 .iter()
                 .any(|byte| *byte != 0)
@@ -233,9 +413,34 @@ impl PersistentMetadataRecord {
         )
         .context("authenticate persistent LUKS2 metadata")?;
 
-        let volume_id_digest = bytes[20..52].try_into().unwrap();
-        if volume_id_digest != volume_id.digest() {
+        let volume_id_digest = bytes
+            [PERSISTENT_VOLUME_ID_DIGEST_OFFSET..PERSISTENT_VOLUME_VERSION_DIGEST_OFFSET]
+            .try_into()
+            .unwrap();
+        if volume_id_digest != binding.volume_id.digest() {
             bail!("persistent LUKS2 metadata belongs to another volume")
+        }
+        let volume_version_digest = bytes
+            [PERSISTENT_VOLUME_VERSION_DIGEST_OFFSET..PERSISTENT_MANIFEST_DIGEST_OFFSET]
+            .try_into()
+            .unwrap();
+        if volume_version_digest != binding.volume_version_digest {
+            bail!("persistent LUKS2 metadata belongs to another volume version")
+        }
+        let manifest_digest = bytes
+            [PERSISTENT_MANIFEST_DIGEST_OFFSET..PERSISTENT_PROFILE_VERSION_OFFSET]
+            .try_into()
+            .unwrap();
+        if manifest_digest != binding.manifest_digest {
+            bail!("persistent LUKS2 metadata belongs to another manifest")
+        }
+        let profile_version = u32::from_be_bytes(
+            bytes[PERSISTENT_PROFILE_VERSION_OFFSET..PERSISTENT_PROFILE_RESERVED_OFFSET]
+                .try_into()
+                .unwrap(),
+        );
+        if profile_version != binding.profile_version {
+            bail!("persistent LUKS2 metadata uses another crypto profile")
         }
         let state = match bytes[10] {
             1 => PersistentLuksState::Prepared,
@@ -252,7 +457,9 @@ impl PersistentMetadataRecord {
         ) {
             bail!("persistent LUKS2 metadata state and sequence do not match")
         }
-        let header_mac = bytes[52..84].try_into().unwrap();
+        let header_mac = bytes[PERSISTENT_HEADER_MAC_OFFSET..PERSISTENT_RECORD_MAC_OFFSET]
+            .try_into()
+            .unwrap();
         if state == PersistentLuksState::Prepared && header_mac != [0; 32] {
             bail!("prepared persistent LUKS2 metadata contains a header MAC")
         }
@@ -264,6 +471,9 @@ impl PersistentMetadataRecord {
             state,
             sequence,
             volume_id_digest,
+            volume_version_digest,
+            manifest_digest,
+            profile_version,
             header_mac,
         }))
     }
@@ -279,6 +489,9 @@ impl PersistentMetadataRecord {
                 .checked_add(1)
                 .context("persistent LUKS2 metadata sequence overflow")?,
             volume_id_digest: self.volume_id_digest,
+            volume_version_digest: self.volume_version_digest,
+            manifest_digest: self.manifest_digest,
+            profile_version: self.profile_version,
             header_mac,
         })
     }
@@ -294,6 +507,9 @@ impl PersistentMetadataRecord {
                 .checked_add(1)
                 .context("persistent LUKS2 metadata sequence overflow")?,
             volume_id_digest: self.volume_id_digest,
+            volume_version_digest: self.volume_version_digest,
+            manifest_digest: self.manifest_digest,
+            profile_version: self.profile_version,
             header_mac: self.header_mac,
         })
     }
@@ -301,16 +517,17 @@ impl PersistentMetadataRecord {
 
 fn derive_persistent_auth_key(
     key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    Ok(Zeroizing::new(
-        compute_hmac(key, PERSISTENT_AUTH_KEY_DOMAIN, &[&volume_id.digest()])?.to_vec(),
-    ))
+    let mut mac = HmacSha256::new_from_slice(key).context("initialize HMAC-SHA256")?;
+    mac.update(PERSISTENT_AUTH_KEY_DOMAIN);
+    binding.update_hmac(&mut mac);
+    Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
 }
 
 fn validate_persistent_key(key: &[u8]) -> Result<()> {
-    if !(PERSISTENT_KEY_MIN_BYTES..=PERSISTENT_KEY_MAX_BYTES).contains(&key.len()) {
-        bail!("persistent LUKS2 keys must contain between 32 and 4096 bytes")
+    if key.len() != PERSISTENT_KEY_BYTES {
+        bail!("persistent LUKS2 keys must contain exactly 32 binary bytes")
     }
     Ok(())
 }
@@ -358,12 +575,6 @@ impl PersistentMountLocks {
 
 static PERSISTENT_MOUNT_LOCKS: LazyLock<PersistentMountLocks> =
     LazyLock::new(PersistentMountLocks::default);
-
-#[derive(Debug, PartialEq, Eq)]
-struct MountedFilesystem {
-    device: DeviceNumber,
-    filesystem_type: String,
-}
 
 /// Returns the path where the detached LUKS header for the given device is stored.
 pub fn luks_header_path(device_path: &str) -> String {
@@ -423,7 +634,7 @@ pub struct Luks2Formatter {
     pub integrity: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IntegrityInitialization {
     SkipWipeWithoutJournal,
     CompleteWithJournal,
@@ -461,54 +672,15 @@ impl Luks2Formatter {
         integrity_initialization: IntegrityInitialization,
         passphrase: &[u8],
     ) -> anyhow::Result<()> {
-        let sector_size_str = SECTOR_SIZE.to_string();
-        let payload_alignment_str =
-            payload_alignment_sectors.map(|alignment| alignment.to_string());
-        let metadata_area_size = PERSISTENT_LUKS2_METADATA_AREA_BYTES.to_string();
-        let keyslots_area_size = PERSISTENT_LUKS2_KEYSLOTS_AREA_BYTES.to_string();
-
-        let mut args: Vec<&str> = vec![
-            "--batch-mode",
-            "luksFormat",
-            "--type",
-            "luks2",
-            "--cipher",
-            "aes-xts-plain64",
-            "--sector-size",
-            &sector_size_str,
-        ];
-
-        if let Some(h) = header_path {
-            args.push("--header");
-            args.push(h);
-        }
-
-        if let Some(alignment) = payload_alignment_str.as_deref() {
-            args.push("--align-payload");
-            args.push(alignment);
-            args.push("--luks2-metadata-size");
-            args.push(&metadata_area_size);
-            args.push("--luks2-keyslots-size");
-            args.push(&keyslots_area_size);
-        }
-
-        append_luks_uuid(&mut args, luks_uuid);
-
-        if self.integrity {
-            args.push("--integrity");
-            args.push(HMAC_SHA256);
-            match integrity_initialization {
-                IntegrityInitialization::SkipWipeWithoutJournal => {
-                    args.push("--integrity-no-wipe");
-                    args.push("--integrity-no-journal");
-                }
-                IntegrityInitialization::CompleteWithJournal => {}
-            }
-        }
-
-        args.push(device_path);
-        args.push("-"); // read passphrase from stdin
-
+        let args = luks_format_arguments(
+            self.integrity,
+            device_path,
+            header_path,
+            payload_alignment_sectors,
+            luks_uuid,
+            integrity_initialization,
+        );
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         run_cryptsetup_stdin(&args, passphrase).context("cryptsetup luksFormat failed")?;
         Ok(())
     }
@@ -533,19 +705,46 @@ impl Luks2Formatter {
         Ok(())
     }
 
-    fn test_passphrase(
+    fn open_persistent_device(
         &self,
         device_path: &str,
-        header_path: Option<&str>,
-        passphrase: &[u8],
+        header_path: &str,
+        name: &str,
+        key: &[u8],
     ) -> anyhow::Result<()> {
-        let mut args = vec!["open", "--test-passphrase", "--key-file", "-"];
-        if let Some(header_path) = header_path {
-            args.push("--header");
-            args.push(header_path);
-        }
-        args.push(device_path);
-        run_cryptsetup_stdin(&args, passphrase).context("cryptsetup passphrase verification failed")
+        let args = [
+            "luksOpen",
+            "--header",
+            header_path,
+            "--keyfile-size",
+            PERSISTENT_KEYFILE_BYTES,
+            "-d",
+            "-",
+            device_path,
+            name,
+        ];
+        run_cryptsetup_stdin(&args, key).context("cryptsetup persistent luksOpen failed")
+    }
+
+    fn test_persistent_passphrase(
+        &self,
+        device_path: &str,
+        header_path: &str,
+        key: &[u8],
+    ) -> anyhow::Result<()> {
+        let args = [
+            "open",
+            "--test-passphrase",
+            "--key-file",
+            "-",
+            "--keyfile-size",
+            PERSISTENT_KEYFILE_BYTES,
+            "--header",
+            header_path,
+            device_path,
+        ];
+        run_cryptsetup_stdin(&args, key)
+            .context("cryptsetup persistent passphrase verification failed")
     }
 
     /// Close a LUKS2 mapping using the `cryptsetup` binary.
@@ -556,11 +755,67 @@ impl Luks2Formatter {
     }
 }
 
-fn append_luks_uuid<'a>(args: &mut Vec<&'a str>, luks_uuid: Option<&'a str>) {
-    if let Some(luks_uuid) = luks_uuid {
-        args.push("--uuid");
-        args.push(luks_uuid);
+fn luks_format_arguments(
+    integrity: bool,
+    device_path: &str,
+    header_path: Option<&str>,
+    payload_alignment_sectors: Option<u64>,
+    luks_uuid: Option<&str>,
+    integrity_initialization: IntegrityInitialization,
+) -> Vec<String> {
+    let mut args = vec![
+        "--batch-mode".to_string(),
+        "luksFormat".to_string(),
+        "--type".to_string(),
+        "luks2".to_string(),
+        "--cipher".to_string(),
+        "aes-xts-plain64".to_string(),
+        "--sector-size".to_string(),
+        SECTOR_SIZE.to_string(),
+    ];
+
+    if integrity_initialization == IntegrityInitialization::CompleteWithJournal {
+        args.extend([
+            "--key-size".to_string(),
+            PERSISTENT_LUKS_KEY_BITS.to_string(),
+            "--keyfile-size".to_string(),
+            PERSISTENT_KEYFILE_BYTES.to_string(),
+            "--pbkdf".to_string(),
+            PERSISTENT_PBKDF.to_string(),
+            "--pbkdf-force-iterations".to_string(),
+            PERSISTENT_PBKDF_ITERATIONS.to_string(),
+            "--hash".to_string(),
+            PERSISTENT_PBKDF_HASH.to_string(),
+        ]);
     }
+
+    if let Some(header_path) = header_path {
+        args.extend(["--header".to_string(), header_path.to_string()]);
+    }
+    if let Some(alignment) = payload_alignment_sectors {
+        args.extend([
+            "--align-payload".to_string(),
+            alignment.to_string(),
+            "--luks2-metadata-size".to_string(),
+            PERSISTENT_LUKS2_METADATA_AREA_BYTES.to_string(),
+            "--luks2-keyslots-size".to_string(),
+            PERSISTENT_LUKS2_KEYSLOTS_AREA_BYTES.to_string(),
+        ]);
+    }
+    if let Some(luks_uuid) = luks_uuid {
+        args.extend(["--uuid".to_string(), luks_uuid.to_string()]);
+    }
+    if integrity {
+        args.extend(["--integrity".to_string(), HMAC_SHA256.to_string()]);
+        if integrity_initialization == IntegrityInitialization::SkipWipeWithoutJournal {
+            args.extend([
+                "--integrity-no-wipe".to_string(),
+                "--integrity-no-journal".to_string(),
+            ]);
+        }
+    }
+    args.extend([device_path.to_string(), "-".to_string()]);
+    args
 }
 
 /// Run cryptsetup with passphrase on stdin. Does not append newline.
@@ -654,10 +909,11 @@ fn persistent_filesystem_action(
     }
 }
 
-async fn block_device_region_is_zero(path: &str, offset: u64) -> Result<bool> {
-    let mut device = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("open block device {path} for initialization check"))?;
+async fn block_device_region_is_zero(device: &File, path: &str, offset: u64) -> Result<bool> {
+    let mut device =
+        tokio::fs::File::from_std(device.try_clone().with_context(|| {
+            format!("clone opened block device {path} for initialization check")
+        })?);
     device
         .seek(SeekFrom::Start(offset))
         .await
@@ -709,8 +965,8 @@ async fn block_device_region_is_zero(path: &str, offset: u64) -> Result<bool> {
     Ok(true)
 }
 
-async fn block_device_is_zero(path: &str) -> Result<bool> {
-    block_device_region_is_zero(path, 0).await
+async fn block_device_is_zero(device: &File, path: &str) -> Result<bool> {
+    block_device_region_is_zero(device, path, 0).await
 }
 
 fn open_persistent_device(path: &str) -> Result<File> {
@@ -735,17 +991,14 @@ fn read_metadata_slot(device: &File, slot: usize) -> Result<[u8; PERSISTENT_META
 fn load_persistent_metadata(
     device: &File,
     auth_key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
 ) -> Result<Option<PersistentMetadataRecord>> {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
 
     for slot in 0..PERSISTENT_METADATA_SLOT_COUNT {
-        match PersistentMetadataRecord::decode(
-            read_metadata_slot(device, slot)?,
-            auth_key,
-            volume_id,
-        ) {
+        match PersistentMetadataRecord::decode(read_metadata_slot(device, slot)?, auth_key, binding)
+        {
             Ok(Some(record)) => valid.push(record),
             Ok(None) => {}
             Err(error) => invalid.push((slot, error)),
@@ -819,11 +1072,11 @@ fn copy_header_and_hmac(
     source: &File,
     destination: &File,
     auth_key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
 ) -> Result<HmacSha256> {
     let mut mac = HmacSha256::new_from_slice(auth_key).context("initialize header HMAC-SHA256")?;
     mac.update(PERSISTENT_HEADER_MAC_DOMAIN);
-    mac.update(&volume_id.digest());
+    binding.update_hmac(&mut mac);
 
     let mut buffer = vec![0u8; 1024 * 1024];
     let mut offset = 0u64;
@@ -846,9 +1099,9 @@ fn persist_header(
     device: &File,
     header: &File,
     auth_key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
 ) -> Result<[u8; 32]> {
-    let mac = copy_header_and_hmac(header, device, auth_key, volume_id)?;
+    let mac = copy_header_and_hmac(header, device, auth_key, binding)?;
     device.sync_data().context("flush detached LUKS2 header")?;
     Ok(mac.finalize().into_bytes().into())
 }
@@ -857,11 +1110,11 @@ fn load_verified_header_in(
     device: &File,
     record: &PersistentMetadataRecord,
     auth_key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
     header_directory: &Path,
 ) -> Result<NamedTempFile> {
     let header = new_persistent_header_file_in(header_directory)?;
-    copy_header_and_hmac(device, header.as_file(), auth_key, volume_id)?
+    copy_header_and_hmac(device, header.as_file(), auth_key, binding)?
         .verify_slice(&record.header_mac)
         .map_err(|_| anyhow::anyhow!("persistent LUKS2 header authentication failed"))?;
     Ok(header)
@@ -871,24 +1124,23 @@ fn load_verified_header(
     device: &File,
     record: &PersistentMetadataRecord,
     auth_key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
 ) -> Result<NamedTempFile> {
     load_verified_header_in(
         device,
         record,
         auth_key,
-        volume_id,
+        binding,
         Path::new(LUKS_HEADERS_STORAGE_DIR),
     )
 }
 
 fn initialize_persistent_header(
-    device_path: &str,
-    device: &File,
+    device: &PinnedPersistentDevice,
     prepared: &PersistentMetadataRecord,
     auth_key: &[u8],
     key: &[u8],
-    volume_id: &PersistentVolumeId,
+    binding: &PersistentVolumeBinding,
     luks_uuid: Option<&str>,
 ) -> Result<(NamedTempFile, PersistentMetadataRecord)> {
     let formatter = Luks2Formatter::default().with_integrity(true);
@@ -899,41 +1151,67 @@ fn initialize_persistent_header(
         .context("protected LUKS2 header path is not UTF-8")?;
     let started = Instant::now();
     info!(
-        device_path,
+        device_path = device.path,
         "starting persistent LUKS2 format and complete dm-integrity tag initialization"
     );
-    formatter
-        .encrypt_device_with_payload_alignment(
-            device_path,
-            Some(header_path),
-            Some(PERSISTENT_DATA_OFFSET_SECTORS),
-            luks_uuid,
-            IntegrityInitialization::CompleteWithJournal,
-            key,
-        )
-        .context("create detached persistent LUKS2 header")?;
+    device.run_path_operation(PersistentPathOperation::Format, || {
+        formatter
+            .encrypt_device_with_payload_alignment(
+                &device.path,
+                Some(header_path),
+                Some(PERSISTENT_DATA_OFFSET_SECTORS),
+                luks_uuid,
+                IntegrityInitialization::CompleteWithJournal,
+                key,
+            )
+            .context("create detached persistent LUKS2 header")
+    })?;
     info!(
-        device_path,
+        device_path = device.path,
         elapsed_seconds = started.elapsed().as_secs(),
         "completed persistent LUKS2 format and dm-integrity tag initialization"
     );
-    let mac = persist_header(device, header.as_file(), auth_key, volume_id)?;
+    let mac = persist_header(&device.file, header.as_file(), auth_key, binding)?;
     let initializing = prepared.with_header(mac)?;
-    store_persistent_metadata(device, &initializing, auth_key)?;
+    store_persistent_metadata(&device.file, &initializing, auth_key)?;
     Ok((header, initializing))
+}
+
+fn block_device_number_from_metadata(
+    metadata: &std::fs::Metadata,
+    path: &str,
+) -> Result<DeviceNumber> {
+    if !metadata.file_type().is_block_device() {
+        bail!("persistent LUKS2 source {path} is not a block device")
+    }
+    let device = metadata.rdev();
+    Ok(DeviceNumber::new(
+        nix::sys::stat::major(device),
+        nix::sys::stat::minor(device),
+    ))
 }
 
 fn block_device_number(path: &str) -> Result<DeviceNumber> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("read block device metadata for {path}"))?;
-    if !metadata.file_type().is_block_device() {
-        bail!("persistent LUKS2 source {path} is not a block device")
-    }
-    let device = metadata.rdev();
-    Ok(DeviceNumber {
-        major: nix::sys::stat::major(device),
-        minor: nix::sys::stat::minor(device),
+    block_device_number_from_metadata(&metadata, path)
+}
+
+fn block_device_identity_from_metadata(
+    metadata: &std::fs::Metadata,
+    path: &str,
+) -> Result<BlockDeviceIdentity> {
+    Ok(BlockDeviceIdentity {
+        number: block_device_number_from_metadata(metadata, path)?,
+        filesystem_device: metadata.dev(),
+        inode: metadata.ino(),
     })
+}
+
+fn block_device_identity(path: &str) -> Result<BlockDeviceIdentity> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("read block device identity for {path}"))?;
+    block_device_identity_from_metadata(&metadata, path)
 }
 
 fn block_device_size(device: &File, path: &str) -> Result<u64> {
@@ -976,14 +1254,20 @@ fn persistent_mapper_backing_path(output: &str) -> Result<&str> {
         .context("cryptsetup status did not identify the mapper backing device")
 }
 
-fn validate_luks_uuid(device_path: &str, header_path: &str, expected: &str) -> Result<()> {
-    let (stdout, _) = run_command(
-        CRYPTSETUP_BIN,
-        &["luksUUID", "--header", header_path, device_path],
-        None,
-    )
-    .context("read persistent LUKS2 UUID")?;
-    validate_luks_uuid_value(stdout.trim(), expected)
+fn validate_luks_uuid(
+    device: &PinnedPersistentDevice,
+    header_path: &str,
+    expected: &str,
+) -> Result<()> {
+    device.run_path_operation(PersistentPathOperation::ReadUuid, || {
+        let (stdout, _) = run_command(
+            CRYPTSETUP_BIN,
+            &["luksUUID", "--header", header_path, &device.path],
+            None,
+        )
+        .context("read persistent LUKS2 UUID")?;
+        validate_luks_uuid_value(stdout.trim(), expected)
+    })
 }
 
 fn validate_luks_uuid_value(actual: &str, expected: &str) -> Result<()> {
@@ -993,23 +1277,207 @@ fn validate_luks_uuid_value(actual: &str, expected: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksMetadata {
+    keyslots: HashMap<String, PersistentLuksKeyslot>,
+    tokens: HashMap<String, serde_json::Value>,
+    segments: HashMap<String, PersistentLuksSegment>,
+    digests: HashMap<String, PersistentLuksDigest>,
+    config: PersistentLuksConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksKeyslot {
+    #[serde(rename = "type")]
+    slot_type: String,
+    key_size: u64,
+    af: PersistentLuksAf,
+    area: PersistentLuksArea,
+    kdf: PersistentLuksKdf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksAf {
+    #[serde(rename = "type")]
+    af_type: String,
+    stripes: u64,
+    hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksArea {
+    #[serde(rename = "type")]
+    area_type: String,
+    offset: String,
+    size: String,
+    encryption: String,
+    key_size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksKdf {
+    #[serde(rename = "type")]
+    kdf_type: String,
+    hash: String,
+    iterations: u64,
+    salt: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksSegment {
+    #[serde(rename = "type")]
+    segment_type: String,
+    offset: String,
+    size: String,
+    iv_tweak: String,
+    encryption: String,
+    sector_size: u32,
+    integrity: PersistentLuksIntegrity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksIntegrity {
+    #[serde(rename = "type")]
+    integrity_type: String,
+    journal_encryption: String,
+    journal_integrity: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksDigest {
+    #[serde(rename = "type")]
+    digest_type: String,
+    keyslots: Vec<String>,
+    segments: Vec<String>,
+    hash: String,
+    iterations: u64,
+    salt: String,
+    digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentLuksConfig {
+    json_size: String,
+    keyslots_size: String,
+}
+
+fn validate_persistent_luks_metadata_json(json: &str) -> Result<()> {
+    let metadata: PersistentLuksMetadata =
+        serde_json::from_str(json).context("parse persistent LUKS2 JSON metadata")?;
+    if !metadata.tokens.is_empty()
+        || metadata.keyslots.len() != 1
+        || metadata.segments.len() != 1
+        || metadata.digests.len() != 1
+    {
+        bail!("persistent LUKS2 metadata has an unexpected object count")
+    }
+
+    let keyslot = metadata
+        .keyslots
+        .get("0")
+        .context("persistent LUKS2 metadata is missing keyslot 0")?;
+    if keyslot.slot_type != "luks2"
+        || keyslot.key_size != PERSISTENT_LUKS_KEY_BYTES
+        || keyslot.af.af_type != "luks1"
+        || keyslot.af.stripes != PERSISTENT_AF_STRIPES
+        || keyslot.af.hash != PERSISTENT_PBKDF_HASH
+        || keyslot.area.area_type != "raw"
+        || keyslot.area.offset != PERSISTENT_KEYSLOT_AREA_OFFSET_BYTES
+        || keyslot.area.size != PERSISTENT_KEYSLOT_AREA_BYTES
+        || keyslot.area.encryption != "aes-xts-plain64"
+        || keyslot.area.key_size != PERSISTENT_LUKS_KEY_BYTES
+        || keyslot.kdf.kdf_type != PERSISTENT_PBKDF
+        || keyslot.kdf.hash != PERSISTENT_PBKDF_HASH
+        || keyslot.kdf.iterations.to_string() != PERSISTENT_PBKDF_ITERATIONS
+        || keyslot.kdf.salt.is_empty()
+    {
+        bail!("persistent LUKS2 keyslot does not match crypto profile")
+    }
+
+    let segment = metadata
+        .segments
+        .get("0")
+        .context("persistent LUKS2 metadata is missing segment 0")?;
+    if segment.segment_type != "crypt"
+        || segment.offset != PERSISTENT_DATA_OFFSET_BYTES.to_string()
+        || segment.size != "dynamic"
+        || segment.iv_tweak != "0"
+        || segment.encryption != "aes-xts-plain64"
+        || segment.sector_size != SECTOR_SIZE
+        || segment.integrity.integrity_type != HMAC_SHA256_STATUS
+        || segment.integrity.journal_encryption != "none"
+        || segment.integrity.journal_integrity != "none"
+    {
+        bail!("persistent LUKS2 segment does not match crypto profile")
+    }
+
+    let digest = metadata
+        .digests
+        .get("0")
+        .context("persistent LUKS2 metadata is missing digest 0")?;
+    if digest.digest_type != "pbkdf2"
+        || digest.keyslots != ["0"]
+        || digest.segments != ["0"]
+        || digest.hash != PERSISTENT_PBKDF_HASH
+        || digest.iterations != PERSISTENT_DIGEST_ITERATIONS
+        || digest.salt.is_empty()
+        || digest.digest.is_empty()
+        || metadata.config.json_size != PERSISTENT_JSON_AREA_BYTES.to_string()
+        || metadata.config.keyslots_size != PERSISTENT_LUKS2_KEYSLOTS_AREA_BYTES.to_string()
+    {
+        bail!("persistent LUKS2 digest or layout does not match crypto profile")
+    }
+    Ok(())
+}
+
+fn validate_persistent_luks_metadata(
+    device: &PinnedPersistentDevice,
+    header_path: &str,
+) -> Result<()> {
+    device.run_path_operation(PersistentPathOperation::ReadProfile, || {
+        let (stdout, _) = run_command(
+            CRYPTSETUP_BIN,
+            &[
+                "luksDump",
+                "--dump-json-metadata",
+                "--header",
+                header_path,
+                &device.path,
+            ],
+            None,
+        )
+        .context("read persistent LUKS2 metadata")?;
+        validate_persistent_luks_metadata_json(&stdout)
+    })
+}
+
 fn verify_existing_mapper(
     formatter: &Luks2Formatter,
-    device_path: &str,
+    device: &PinnedPersistentDevice,
     header_path: &str,
-    expected_device: DeviceNumber,
     mapper_name: &str,
     key: &[u8],
 ) -> Result<()> {
-    formatter
-        .test_passphrase(device_path, Some(header_path), key)
-        .context("verify key for existing persistent mapper")?;
+    device.run_path_operation(PersistentPathOperation::VerifyKey, || {
+        formatter
+            .test_persistent_passphrase(&device.path, header_path, key)
+            .context("verify key for existing persistent mapper")
+    })?;
 
     let (stdout, _) = run_command(CRYPTSETUP_BIN, &["status", mapper_name], None)
         .context("inspect existing persistent mapper")?;
     let backing_path = persistent_mapper_backing_path(&stdout)?;
     let actual_device = block_device_number(backing_path)?;
-    if actual_device != expected_device {
+    if actual_device != device.identity.number {
         bail!("persistent mapper name is active for another block device")
     }
     Ok(())
@@ -1039,42 +1507,6 @@ fn decode_mountinfo_path(input: &str) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
-fn mounted_filesystem_from_mountinfo(
-    mountinfo: &str,
-    mount_point: &str,
-) -> Result<Option<MountedFilesystem>> {
-    for line in mountinfo.lines() {
-        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() < 6 || decode_mountinfo_path(fields[4]) != mount_point {
-            continue;
-        }
-        let separator = fields
-            .iter()
-            .position(|field| *field == "-")
-            .context("mountinfo entry has no filesystem separator")?;
-        let filesystem_type = fields
-            .get(separator + 1)
-            .context("mountinfo entry has no filesystem type")?;
-        let (major, minor) = fields[2]
-            .split_once(':')
-            .context("mountinfo has an invalid device number")?;
-        return Ok(Some(MountedFilesystem {
-            device: DeviceNumber {
-                major: major.parse().context("parse mountinfo major number")?,
-                minor: minor.parse().context("parse mountinfo minor number")?,
-            },
-            filesystem_type: (*filesystem_type).to_string(),
-        }));
-    }
-    Ok(None)
-}
-
-fn mounted_filesystem_at(mount_point: &str) -> Result<Option<MountedFilesystem>> {
-    let mountinfo =
-        std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")?;
-    mounted_filesystem_from_mountinfo(&mountinfo, mount_point)
-}
-
 fn mount_point_for_device(device: DeviceNumber) -> Result<Option<String>> {
     let mountinfo =
         std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")?;
@@ -1099,6 +1531,7 @@ fn mount_point_for_device(device: DeviceNumber) -> Result<Option<String>> {
     Ok(None)
 }
 
+#[cfg(test)]
 fn mount_filesystem(device_path: &str, mount_point: &str, fs_type: FsType) -> Result<()> {
     mount::<_, _, str, _>(
         Some(device_path),
@@ -1110,29 +1543,8 @@ fn mount_filesystem(device_path: &str, mount_point: &str, fs_type: FsType) -> Re
     .with_context(|| format!("mount persistent device {device_path} at {mount_point}"))
 }
 
-async fn prepare_persistent_mount_point(mount_point: &str) -> Result<()> {
-    tokio::fs::create_dir_all(mount_point)
-        .await
-        .with_context(|| format!("create persistent mount point {mount_point}"))?;
-
-    let metadata = tokio::fs::symlink_metadata(mount_point)
-        .await
-        .with_context(|| format!("inspect persistent mount point {mount_point}"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("persistent mount point must be a directory, not a symlink")
-    }
-
-    let canonical = tokio::fs::canonicalize(mount_point)
-        .await
-        .with_context(|| format!("resolve persistent mount point {mount_point}"))?;
-    if canonical != Path::new(mount_point) {
-        bail!("persistent mount point must not contain symlink components")
-    }
-    Ok(())
-}
-
 struct PreparedPersistentMapper {
-    device: File,
+    device: PinnedPersistentDevice,
     auth_key: Zeroizing<Vec<u8>>,
     record: PersistentMetadataRecord,
     mapper_name: String,
@@ -1162,74 +1574,60 @@ impl PreparedPersistentMapper {
             .context("open initialized persistent mapper for flush")?
             .sync_all()
             .context("flush initialized persistent filesystem")?;
-        store_persistent_metadata(&self.device, &self.record.ready()?, &self.auth_key)
+        store_persistent_metadata(&self.device.file, &self.record.ready()?, &self.auth_key)
             .context("commit persistent LUKS2 initialization")
     }
 }
 
 async fn prepare_persistent_mapper(
     device_path: &str,
+    expected_device: DeviceNumber,
     key: Zeroizing<Vec<u8>>,
-    volume_id: PersistentVolumeId,
+    binding: PersistentVolumeBinding,
     luks_uuid: Option<&str>,
     expected_size_bytes: Option<u64>,
 ) -> Result<PreparedPersistentMapper> {
     validate_persistent_key(&key)?;
-    let source_device = block_device_number(device_path)?;
-    let device_lock = PERSISTENT_MOUNT_LOCKS.for_device(source_device).await;
+    let device_lock = PERSISTENT_MOUNT_LOCKS.for_device(expected_device).await;
     let device_guard = device_lock.lock_owned().await;
-    let mapper_name = volume_id.mapper_name();
+    let mapper_name = binding.mapper_name();
     let mapper_path = format!("/dev/mapper/{mapper_name}");
     let mapper_exists = Path::new(&mapper_path).exists();
     let formatter = Luks2Formatter::default().with_integrity(true);
 
-    let device = open_persistent_device(device_path)?;
+    let device = PinnedPersistentDevice::open(device_path, expected_device)?;
     if let Some(expected_size_bytes) = expected_size_bytes {
-        let actual_size_bytes = block_device_size(&device, device_path)?;
+        let actual_size_bytes = block_device_size(&device.file, device_path)?;
         validate_block_device_size(actual_size_bytes, expected_size_bytes)?;
     }
-    let auth_key = derive_persistent_auth_key(&key, &volume_id)?;
-    let existing_record = load_persistent_metadata(&device, &auth_key, &volume_id)?;
+    let auth_key = derive_persistent_auth_key(&key, &binding)?;
+    let existing_record = load_persistent_metadata(&device.file, &auth_key, &binding)?;
     let (header, record) = match existing_record {
         Some(record) if record.state == PersistentLuksState::Prepared => {
             if mapper_exists {
                 bail!("persistent mapper exists before its LUKS2 header was committed")
             }
-            if !block_device_region_is_zero(device_path, PERSISTENT_DATA_OFFSET_BYTES).await? {
+            if !block_device_region_is_zero(&device.file, device_path, PERSISTENT_DATA_OFFSET_BYTES)
+                .await?
+            {
                 bail!("prepared persistent LUKS2 device contains nonzero payload data")
             }
-            initialize_persistent_header(
-                device_path,
-                &device,
-                &record,
-                &auth_key,
-                &key,
-                &volume_id,
-                luks_uuid,
-            )?
+            initialize_persistent_header(&device, &record, &auth_key, &key, &binding, luks_uuid)?
         }
         Some(record) => {
-            let header = load_verified_header(&device, &record, &auth_key, &volume_id)?;
+            let header = load_verified_header(&device.file, &record, &auth_key, &binding)?;
             (header, record)
         }
         None => {
             if mapper_exists {
                 bail!("persistent mapper exists for a device with no CDH metadata")
             }
-            if !block_device_is_zero(device_path).await? {
+            if !block_device_is_zero(&device.file, device_path).await? {
                 bail!("refusing to initialize a nonzero block device without CDH metadata")
             }
-            let prepared = PersistentMetadataRecord::prepared(&volume_id);
-            store_persistent_metadata(&device, &prepared, &auth_key)?;
-            initialize_persistent_header(
-                device_path,
-                &device,
-                &prepared,
-                &auth_key,
-                &key,
-                &volume_id,
-                luks_uuid,
-            )?
+            let prepared = PersistentMetadataRecord::prepared(&binding);
+            store_persistent_metadata(&device.file, &prepared, &auth_key)?;
+            initialize_persistent_header(&device, &prepared, &auth_key, &key, &binding, luks_uuid)?
         }
     };
     let header_path = header
@@ -1237,8 +1635,9 @@ async fn prepare_persistent_mapper(
         .to_str()
         .context("protected LUKS2 header path is not UTF-8")?;
     if let Some(expected_uuid) = luks_uuid {
-        validate_luks_uuid(device_path, header_path, expected_uuid)?;
+        validate_luks_uuid(&device, header_path, expected_uuid)?;
     }
+    validate_persistent_luks_metadata(&device, header_path)?;
 
     let mut prepared = PreparedPersistentMapper {
         device,
@@ -1253,17 +1652,30 @@ async fn prepare_persistent_mapper(
         if mapper_exists {
             verify_existing_mapper(
                 &formatter,
-                device_path,
+                &prepared.device,
                 header_path,
-                source_device,
                 &prepared.mapper_name,
                 &key,
             )?;
         } else {
-            formatter
-                .open_device(device_path, Some(header_path), &prepared.mapper_name, &key)
-                .context("open persistent LUKS2 device")?;
-            prepared.opened_mapper = true;
+            let mut mapper_opened = false;
+            let open_result =
+                prepared
+                    .device
+                    .run_path_operation(PersistentPathOperation::Open, || {
+                        formatter
+                            .open_persistent_device(
+                                &prepared.device.path,
+                                header_path,
+                                &prepared.mapper_name,
+                                &key,
+                            )
+                            .context("open persistent LUKS2 device")?;
+                        mapper_opened = true;
+                        Ok(())
+                    });
+            prepared.opened_mapper = mapper_opened;
+            open_result?;
         }
         Ok(())
     })();
@@ -1274,6 +1686,7 @@ async fn prepare_persistent_mapper(
     Ok(prepared)
 }
 
+#[derive(Debug)]
 pub(crate) struct PersistentActivation {
     pub mapper_name: String,
     pub device_path: String,
@@ -1286,15 +1699,17 @@ pub(crate) struct PersistentActivation {
 /// mapper and owns the final container-scoped mount.
 pub(crate) async fn activate_persistent_ext4(
     device_path: &str,
+    expected_device: DeviceNumber,
     key: Zeroizing<Vec<u8>>,
-    volume_id: PersistentVolumeId,
+    binding: PersistentVolumeBinding,
     luks_uuid: &str,
     expected_size_bytes: u64,
 ) -> Result<PersistentActivation> {
     let prepared = prepare_persistent_mapper(
         device_path,
+        expected_device,
         key,
-        volume_id,
+        binding,
         Some(luks_uuid),
         Some(expected_size_bytes),
     )
@@ -1332,26 +1747,6 @@ pub(crate) async fn activate_persistent_ext4(
     })
 }
 
-#[derive(Default)]
-struct PersistentMountTransaction {
-    mount_point: String,
-    mounted_filesystem: bool,
-}
-
-impl PersistentMountTransaction {
-    fn rollback(&self) {
-        if self.mounted_filesystem {
-            if let Err(error) = nix::mount::umount(self.mount_point.as_str()) {
-                warn!(
-                    mount_point = %self.mount_point,
-                    %error,
-                    "failed to roll back persistent filesystem mount"
-                );
-            }
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Luks2MountParameters {
     /// Indicates whether to enable dm-integrity.
@@ -1376,128 +1771,6 @@ pub struct Luks2MountParameters {
 }
 
 impl Luks2MountParameters {
-    pub(crate) fn validate_persistent(&self) -> std::result::Result<(), &'static str> {
-        if self.mapper_name.is_some() {
-            return Err("mapperName is derived from volumeId and must be omitted");
-        }
-        match self.data_integrity.as_deref() {
-            Some("true") => {}
-            None | Some("false") => return Err("persistent mode requires dataIntegrity=true"),
-            Some(_) => return Err("dataIntegrity must be true or false"),
-        }
-        match &self.target_type {
-            TargetType::Device => {
-                return Err("persistent mode currently requires a filesystem target")
-            }
-            TargetType::FileSystem {
-                mkfs_opts: Some(_), ..
-            } => return Err("mkfsOpts are not accepted by persistent mode"),
-            TargetType::FileSystem {
-                mkfs_opts: None, ..
-            } => {}
-        }
-        Ok(())
-    }
-
-    /// Initialize or reopen a persistent LUKS2 filesystem.
-    ///
-    /// The host controls the block device, including its LUKS2 metadata. CDH
-    /// therefore authenticates the complete header and gives cryptsetup only a
-    /// verified detached copy held under `/run`. Two authenticated state slots
-    /// allow initialization to resume after an interrupted write. They do not
-    /// prevent the host from replaying an older, valid disk image.
-    pub(crate) async fn do_mount_persistent(
-        self,
-        device_path: &str,
-        mount_point: &str,
-        key: Zeroizing<Vec<u8>>,
-        volume_id: PersistentVolumeId,
-    ) -> Result<()> {
-        self.do_mount_persistent_inner(device_path, mount_point, key, volume_id)
-            .await
-    }
-
-    async fn do_mount_persistent_inner(
-        self,
-        device_path: &str,
-        mount_point: &str,
-        key: Zeroizing<Vec<u8>>,
-        volume_id: PersistentVolumeId,
-    ) -> Result<()> {
-        self.validate_persistent().map_err(anyhow::Error::msg)?;
-        let filesystem_type = match self.target_type {
-            TargetType::FileSystem {
-                filesystem_type, ..
-            } => filesystem_type,
-            TargetType::Device => unreachable!("persistent parameters validated above"),
-        };
-
-        prepare_persistent_mount_point(mount_point).await?;
-        let prepared = prepare_persistent_mapper(device_path, key, volume_id, None, None).await?;
-        let mapper_path = prepared.mapper_path.clone();
-        let state = prepared.record.state;
-
-        let mut transaction = PersistentMountTransaction {
-            mount_point: mount_point.to_string(),
-            ..Default::default()
-        };
-
-        let result = (|| -> Result<()> {
-            let mapper_device = block_device_number(&mapper_path)?;
-            let already_mounted = match mounted_filesystem_at(mount_point)? {
-                Some(mounted)
-                    if mounted.device == mapper_device
-                        && mounted.filesystem_type == filesystem_type.as_ref() =>
-                {
-                    true
-                }
-                Some(mounted) if mounted.device == mapper_device => {
-                    bail!(
-                        "persistent mount point has filesystem type {}, expected {}",
-                        mounted.filesystem_type,
-                        filesystem_type.as_ref()
-                    )
-                }
-                Some(_) => bail!("persistent mount point is active for another device"),
-                None => false,
-            };
-
-            if !already_mounted {
-                let filesystem_probe = probe_filesystem(&mapper_path)?;
-                match persistent_filesystem_action(state, &filesystem_probe, filesystem_type)? {
-                    PersistentFilesystemAction::MountExisting => {
-                        mount_filesystem(&mapper_path, mount_point, filesystem_type)
-                            .context("mount existing persistent filesystem")?;
-                        transaction.mounted_filesystem = true;
-                    }
-                    PersistentFilesystemAction::FormatThenMount => {
-                        let fs_formatter = FsFormatter {
-                            fs_type: filesystem_type,
-                            force: true,
-                            args: Vec::new(),
-                        };
-                        fs_formatter
-                            .format_with_eager_inode_initialization(&mapper_path)
-                            .context("create persistent ext4 filesystem")?;
-                        mount_filesystem(&mapper_path, mount_point, filesystem_type)
-                            .context("mount initialized persistent filesystem")?;
-                        transaction.mounted_filesystem = true;
-                    }
-                }
-            }
-
-            prepared.commit_initialization()?;
-
-            Ok(())
-        })();
-
-        if result.is_err() {
-            transaction.rollback();
-            prepared.rollback();
-        }
-        result
-    }
-
     /// Do the mount operation for the LUKS2 device.
     /// Returns the header path if the source type is empty.
     pub async fn do_mount(
@@ -1657,36 +1930,68 @@ mod tests {
     use super::*;
 
     const TEST_PASSPHRASE: &[u8] = b"test";
+    const TEST_PERSISTENT_KEY: &[u8; PERSISTENT_KEY_BYTES] = b"0123456789abcdef0123456789abcdef";
+    const TEST_LUKS_UUID: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
     const NAME: &str = "test";
 
-    fn persistent_parameters() -> Luks2MountParameters {
-        Luks2MountParameters {
-            data_integrity: Some("true".to_string()),
-            mapper_name: None,
-            target_type: TargetType::FileSystem {
-                filesystem_type: FsType::Ext4,
-                mkfs_opts: None,
-            },
-        }
+    fn persistent_binding(volume_id: &str) -> PersistentVolumeBinding {
+        PersistentVolumeBinding::new(
+            PersistentVolumeId::try_from(volume_id).unwrap(),
+            "generation-1",
+            Sha256::digest(format!("manifest:{volume_id}")).into(),
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn typed_profile_sets_and_verifies_the_manifest_luks_uuid() {
-        let mut args = vec!["luksFormat"];
-        append_luks_uuid(&mut args, Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+    fn typed_profile_pins_every_luks_format_argument() {
+        let args = luks_format_arguments(
+            true,
+            "/dev/vdb",
+            Some("/run/header"),
+            Some(PERSISTENT_DATA_OFFSET_SECTORS),
+            Some(TEST_LUKS_UUID),
+            IntegrityInitialization::CompleteWithJournal,
+        );
         assert_eq!(
             args,
             [
+                "--batch-mode",
                 "luksFormat",
+                "--type",
+                "luks2",
+                "--cipher",
+                "aes-xts-plain64",
+                "--sector-size",
+                "4096",
+                "--key-size",
+                "512",
+                "--keyfile-size",
+                "32",
+                "--pbkdf",
+                "pbkdf2",
+                "--pbkdf-force-iterations",
+                "100000",
+                "--hash",
+                "sha256",
+                "--header",
+                "/run/header",
+                "--align-payload",
+                "32784",
+                "--luks2-metadata-size",
+                "16384",
+                "--luks2-keyslots-size",
+                "16744448",
                 "--uuid",
-                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "--integrity",
+                "hmac-sha256",
+                "/dev/vdb",
+                "-",
             ]
         );
-        validate_luks_uuid_value(
-            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
-        )
-        .unwrap();
+        validate_luks_uuid_value(TEST_LUKS_UUID, TEST_LUKS_UUID).unwrap();
         assert!(validate_luks_uuid_value(
             "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee",
             "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
@@ -1694,6 +1999,38 @@ mod tests {
         .is_err());
         validate_block_device_size(1024 * 1024 * 1024, 1024 * 1024 * 1024).unwrap();
         assert!(validate_block_device_size(1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024).is_err());
+    }
+
+    fn persistent_luks_metadata_fixture() -> &'static str {
+        r#"{
+          "keyslots":{"0":{"type":"luks2","key_size":64,
+            "af":{"type":"luks1","stripes":4000,"hash":"sha256"},
+            "area":{"type":"raw","offset":"32768","size":"258048","encryption":"aes-xts-plain64","key_size":64},
+            "kdf":{"type":"pbkdf2","hash":"sha256","iterations":100000,"salt":"salt"}}},
+          "tokens":{},
+          "segments":{"0":{"type":"crypt","offset":"16785408","size":"dynamic","iv_tweak":"0",
+            "encryption":"aes-xts-plain64","sector_size":4096,
+            "integrity":{"type":"hmac(sha256)","journal_encryption":"none","journal_integrity":"none"}}},
+          "digests":{"0":{"type":"pbkdf2","keyslots":["0"],"segments":["0"],"hash":"sha256",
+            "iterations":1000,"salt":"salt","digest":"digest"}},
+          "config":{"json_size":"12288","keyslots_size":"16744448"}
+        }"#
+    }
+
+    #[test]
+    fn effective_luks_metadata_must_match_the_complete_profile() {
+        let valid = persistent_luks_metadata_fixture();
+        validate_persistent_luks_metadata_json(valid).unwrap();
+
+        for invalid in [
+            valid.replace("\"iterations\":100000", "\"iterations\":99999"),
+            valid.replace("\"key_size\":64", "\"key_size\":32"),
+            valid.replace("hmac(sha256)", "crc32c"),
+            valid.replace("\"sector_size\":4096", "\"sector_size\":512"),
+            valid.replace("\"tokens\":{}", "\"tokens\":{\"0\":{}}"),
+        ] {
+            assert!(validate_persistent_luks_metadata_json(&invalid).is_err());
+        }
     }
 
     #[tokio::test]
@@ -1712,6 +2049,71 @@ mod tests {
         let _guard = first.clone().lock_owned().await;
         assert!(alias.try_lock().is_err());
         assert!(other.try_lock().is_ok());
+    }
+
+    #[test]
+    fn every_path_operation_rejects_device_rebinding() {
+        let expected = BlockDeviceIdentity {
+            number: DeviceNumber::new(8, 1),
+            filesystem_device: 17,
+            inode: 100,
+        };
+        // A replacement can reuse the same major/minor. The devnode identity
+        // must still change so pathname operations fail closed.
+        let replacement = BlockDeviceIdentity {
+            number: expected.number,
+            filesystem_device: expected.filesystem_device,
+            inode: 101,
+        };
+
+        for boundary in PersistentPathOperation::ALL {
+            let mut operation_called = false;
+            let error = checked_path_operation(
+                expected,
+                boundary,
+                || Ok(replacement),
+                || {
+                    operation_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(
+                !operation_called,
+                "{boundary:?} ran after a pre-check failure"
+            );
+            assert!(error.to_string().contains("changed before"));
+
+            let mut identities = [expected, replacement].into_iter();
+            let mut operation_called = false;
+            let error = checked_path_operation(
+                expected,
+                boundary,
+                || Ok(identities.next().unwrap()),
+                || {
+                    operation_called = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(
+                operation_called,
+                "{boundary:?} did not run after a valid pre-check"
+            );
+            assert!(error.to_string().contains("changed during"));
+
+            let mut identities = [expected, expected].into_iter();
+            assert_eq!(
+                checked_path_operation(
+                    expected,
+                    boundary,
+                    || Ok(identities.next().unwrap()),
+                    || Ok(42),
+                )
+                .unwrap(),
+                42
+            );
+        }
     }
 
     #[test]
@@ -1814,41 +2216,57 @@ mod tests {
 
     #[test]
     fn persistent_metadata_is_authenticated_and_volume_bound() {
-        let id = PersistentVolumeId::try_from("tenant/example/web-data").unwrap();
-        let other = PersistentVolumeId::try_from("tenant/example/database").unwrap();
-        let key = derive_persistent_auth_key(b"volume key", &id).unwrap();
-        let prepared = PersistentMetadataRecord::prepared(&id);
+        let binding = persistent_binding("tenant/example/web-data");
+        let other = persistent_binding("tenant/example/database");
+        let other_version = PersistentVolumeBinding::new(
+            binding.volume_id.clone(),
+            "generation-2",
+            binding.manifest_digest,
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let other_manifest = PersistentVolumeBinding::new(
+            binding.volume_id.clone(),
+            "generation-1",
+            [0x5a; 32],
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let key = derive_persistent_auth_key(TEST_PERSISTENT_KEY, &binding).unwrap();
+        let prepared = PersistentMetadataRecord::prepared(&binding);
         let encoded = prepared.encode(&key).unwrap();
 
         assert_eq!(
-            PersistentMetadataRecord::decode(encoded, &key, &id)
+            PersistentMetadataRecord::decode(encoded, &key, &binding)
                 .unwrap()
                 .unwrap(),
             prepared
         );
         assert!(PersistentMetadataRecord::decode(encoded, &key, &other).is_err());
+        assert!(PersistentMetadataRecord::decode(encoded, &key, &other_version).is_err());
+        assert!(PersistentMetadataRecord::decode(encoded, &key, &other_manifest).is_err());
 
-        let wrong_key = derive_persistent_auth_key(b"wrong key", &id).unwrap();
-        assert!(PersistentMetadataRecord::decode(encoded, &wrong_key, &id).is_err());
+        let wrong_key = derive_persistent_auth_key(&[0x7f; 32], &binding).unwrap();
+        assert!(PersistentMetadataRecord::decode(encoded, &wrong_key, &binding).is_err());
 
         let mut tampered = encoded;
         tampered[52] ^= 1;
-        assert!(PersistentMetadataRecord::decode(tampered, &key, &id).is_err());
+        assert!(PersistentMetadataRecord::decode(tampered, &key, &binding).is_err());
     }
 
     #[test]
     fn persistent_metadata_recovers_the_last_complete_slot() {
         let device = tempfile::tempfile().unwrap();
         device.set_len(PERSISTENT_DATA_OFFSET_BYTES + 4096).unwrap();
-        let id = PersistentVolumeId::try_from("tenant/example/web-data").unwrap();
-        let key = derive_persistent_auth_key(b"volume key", &id).unwrap();
-        let prepared = PersistentMetadataRecord::prepared(&id);
+        let binding = persistent_binding("tenant/example/web-data");
+        let key = derive_persistent_auth_key(TEST_PERSISTENT_KEY, &binding).unwrap();
+        let prepared = PersistentMetadataRecord::prepared(&binding);
         store_persistent_metadata(&device, &prepared, &key).unwrap();
         let initializing = prepared.with_header([7; 32]).unwrap();
         store_persistent_metadata(&device, &initializing, &key).unwrap();
 
         assert_eq!(
-            load_persistent_metadata(&device, &key, &id)
+            load_persistent_metadata(&device, &key, &binding)
                 .unwrap()
                 .unwrap(),
             initializing
@@ -1858,7 +2276,7 @@ mod tests {
             .write_all_at(&[0xa5; 128], PERSISTENT_METADATA_OFFSET_BYTES)
             .expect("corrupt older metadata slot");
         assert_eq!(
-            load_persistent_metadata(&device, &key, &id)
+            load_persistent_metadata(&device, &key, &binding)
                 .unwrap()
                 .unwrap(),
             initializing
@@ -1874,66 +2292,35 @@ mod tests {
         header.set_len(LUKS2_HEADER_MIN_SIZE_BYTES).unwrap();
         header.write_all_at(b"LUKS header", 0).unwrap();
 
-        let id = PersistentVolumeId::try_from("tenant/example/web-data").unwrap();
-        let key = derive_persistent_auth_key(b"volume key", &id).unwrap();
-        let prepared = PersistentMetadataRecord::prepared(&id);
+        let binding = persistent_binding("tenant/example/web-data");
+        let key = derive_persistent_auth_key(TEST_PERSISTENT_KEY, &binding).unwrap();
+        let prepared = PersistentMetadataRecord::prepared(&binding);
         let record = prepared
-            .with_header(persist_header(&device, &header, &key, &id).unwrap())
+            .with_header(persist_header(&device, &header, &key, &binding).unwrap())
             .unwrap();
         assert!(
-            load_verified_header_in(&device, &record, &key, &id, header_directory.path(),).is_ok()
+            load_verified_header_in(&device, &record, &key, &binding, header_directory.path(),)
+                .is_ok()
         );
 
         device.write_all_at(b"X", 4).unwrap();
-        let error = load_verified_header_in(&device, &record, &key, &id, header_directory.path())
-            .unwrap_err();
+        let error =
+            load_verified_header_in(&device, &record, &key, &binding, header_directory.path())
+                .unwrap_err();
         assert!(error
             .to_string()
             .contains("persistent LUKS2 header authentication failed"));
     }
 
     #[test]
-    fn persistent_parameter_subset_rejects_unsafe_options() {
-        assert!(persistent_parameters().validate_persistent().is_ok());
-
-        let mut parameters = persistent_parameters();
-        parameters.mapper_name = Some("caller-controlled".to_string());
-        assert!(parameters.validate_persistent().is_err());
-
-        let mut parameters = persistent_parameters();
-        parameters.data_integrity = Some("false".to_string());
-        assert!(parameters.validate_persistent().is_err());
-
-        let mut parameters = persistent_parameters();
-        parameters.data_integrity = None;
-        assert!(parameters.validate_persistent().is_err());
-
-        let mut parameters = persistent_parameters();
-        parameters.data_integrity = Some("not-a-bool".to_string());
-        assert!(parameters.validate_persistent().is_err());
-
-        let mut parameters = persistent_parameters();
-        parameters.target_type = TargetType::Device;
-        assert!(parameters.validate_persistent().is_err());
-
-        let mut parameters = persistent_parameters();
-        parameters.target_type = TargetType::FileSystem {
-            filesystem_type: FsType::Ext4,
-            mkfs_opts: Some("-F /dev/other".to_string()),
-        };
-        assert!(parameters.validate_persistent().is_err());
+    fn persistent_key_size_is_exact() {
+        assert!(validate_persistent_key(&[0; PERSISTENT_KEY_BYTES]).is_ok());
+        assert!(validate_persistent_key(&[0; PERSISTENT_KEY_BYTES - 1]).is_err());
+        assert!(validate_persistent_key(&[0; PERSISTENT_KEY_BYTES + 1]).is_err());
     }
 
     #[test]
-    fn persistent_key_size_is_bounded() {
-        assert!(validate_persistent_key(&[0; PERSISTENT_KEY_MIN_BYTES]).is_ok());
-        assert!(validate_persistent_key(&[0; PERSISTENT_KEY_MAX_BYTES]).is_ok());
-        assert!(validate_persistent_key(&[0; PERSISTENT_KEY_MIN_BYTES - 1]).is_err());
-        assert!(validate_persistent_key(&vec![0; PERSISTENT_KEY_MAX_BYTES + 1]).is_err());
-    }
-
-    #[test]
-    fn parsers_require_exact_mapper_and_mount_identity() {
+    fn parser_requires_exact_mapper_identity() {
         let status = concat!(
             "/dev/mapper/coco-pv-test is active.\n",
             "  type: LUKS2\n",
@@ -1956,52 +2343,6 @@ mod tests {
             parse_cryptsetup_status_field("type: LUKS2\n", "device"),
             None
         );
-
-        let mountinfo = concat!(
-            "35 24 0:31 / /run rw,nosuid - tmpfs tmpfs rw\n",
-            "36 35 253:7 / /run/secure\\040volume rw,noatime - ext4 /dev/mapper/coco-pv-test rw\n"
-        );
-        assert_eq!(
-            mounted_filesystem_from_mountinfo(mountinfo, "/run/secure volume").unwrap(),
-            Some(MountedFilesystem {
-                device: DeviceNumber {
-                    major: 253,
-                    minor: 7
-                },
-                filesystem_type: "ext4".to_string()
-            })
-        );
-        assert_eq!(
-            mounted_filesystem_from_mountinfo(mountinfo, "/run/not-mounted").unwrap(),
-            None
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn persistent_mount_point_rejects_symlinks() {
-        let directory = tempfile::tempdir().unwrap();
-        let direct = directory.path().join("direct");
-        prepare_persistent_mount_point(direct.to_str().unwrap())
-            .await
-            .unwrap();
-
-        let symlink = directory.path().join("symlink");
-        tokio::fs::symlink(&direct, &symlink).await.unwrap();
-        assert!(prepare_persistent_mount_point(symlink.to_str().unwrap())
-            .await
-            .is_err());
-
-        let real_parent = directory.path().join("real-parent");
-        tokio::fs::create_dir(&real_parent).await.unwrap();
-        let parent_symlink = directory.path().join("parent-symlink");
-        tokio::fs::symlink(&real_parent, &parent_symlink)
-            .await
-            .unwrap();
-        let child = parent_symlink.join("child");
-        assert!(prepare_persistent_mount_point(child.to_str().unwrap())
-            .await
-            .is_err());
     }
 
     #[tokio::test]
@@ -2011,30 +2352,39 @@ mod tests {
         tokio::fs::write(path, vec![0u8; ZERO_SCAN_BUFFER_SIZE + 1])
             .await
             .unwrap();
-        assert!(block_device_is_zero(path.to_str().unwrap()).await.unwrap());
+        assert!(block_device_is_zero(file.as_file(), path.to_str().unwrap())
+            .await
+            .unwrap());
 
         let mut data = vec![0u8; ZERO_SCAN_BUFFER_SIZE + 1];
         *data.last_mut().unwrap() = 1;
         tokio::fs::write(path, data).await.unwrap();
-        assert!(!block_device_is_zero(path.to_str().unwrap()).await.unwrap());
+        assert!(
+            !block_device_is_zero(file.as_file(), path.to_str().unwrap())
+                .await
+                .unwrap()
+        );
 
         tokio::fs::write(path, [1, 2, 3, 4, 0, 0, 0, 0])
             .await
             .unwrap();
-        assert!(block_device_region_is_zero(path.to_str().unwrap(), 4)
-            .await
-            .unwrap());
+        assert!(
+            block_device_region_is_zero(file.as_file(), path.to_str().unwrap(), 4)
+                .await
+                .unwrap()
+        );
 
         tokio::fs::write(path, []).await.unwrap();
-        assert!(block_device_is_zero(path.to_str().unwrap()).await.is_err());
+        assert!(block_device_is_zero(file.as_file(), path.to_str().unwrap())
+            .await
+            .is_err());
     }
 
-    /// Removes the LUKS header file on drop so tests don't leave files behind on panic.
-    struct RemoveHeaderOnDrop(String);
-    impl Drop for RemoveHeaderOnDrop {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+    fn temporary_header_path() -> (tempfile::TempDir, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("luks.header");
+        let path = path.to_str().unwrap().to_string();
+        (directory, path)
     }
 
     /// Closes the dm-crypt device on drop so tests don't leave mapper devices behind.
@@ -2060,14 +2410,44 @@ mod tests {
     fn persistent_state(
         device_path: &str,
         key: &[u8],
-        volume_id: &PersistentVolumeId,
+        binding: &PersistentVolumeBinding,
     ) -> PersistentLuksState {
         let device = open_persistent_device(device_path).unwrap();
-        let auth_key = derive_persistent_auth_key(key, volume_id).unwrap();
-        load_persistent_metadata(&device, &auth_key, volume_id)
+        let auth_key = derive_persistent_auth_key(key, binding).unwrap();
+        load_persistent_metadata(&device, &auth_key, binding)
             .unwrap()
             .unwrap()
             .state
+    }
+
+    async fn activate_test_volume(
+        device_path: &str,
+        key: &[u8],
+        binding: PersistentVolumeBinding,
+    ) -> Result<PersistentActivation> {
+        let device = open_persistent_device(device_path)?;
+        let expected_size = block_device_size(&device, device_path)?;
+        let expected_device = block_device_number(device_path)?;
+        activate_persistent_ext4(
+            device_path,
+            expected_device,
+            Zeroizing::new(key.to_vec()),
+            binding,
+            TEST_LUKS_UUID,
+            expected_size,
+        )
+        .await
+    }
+
+    async fn activate_and_mount_test_volume(
+        device_path: &str,
+        mount_point: &str,
+        key: &[u8],
+        binding: PersistentVolumeBinding,
+    ) -> Result<PersistentActivation> {
+        let activation = activate_test_volume(device_path, key, binding).await?;
+        mount_filesystem(&activation.device_path, mount_point, FsType::Ext4)?;
+        Ok(activation)
     }
 
     fn device_digest(device_path: &str) -> [u8; 32] {
@@ -2092,21 +2472,15 @@ mod tests {
         let device = TempFileLoopDevice::new(128 * 1024 * 1024).unwrap();
         let mount_directory = tempfile::tempdir().unwrap();
         let mount_point = mount_directory.path().to_str().unwrap();
-        let volume_id = PersistentVolumeId::try_from("tenant/workload/test-volume").unwrap();
-        let mapper_name = volume_id.mapper_name();
+        let binding = persistent_binding("tenant/workload/test-volume");
+        let mapper_name = binding.mapper_name();
         let _resources = PersistentResourcesOnDrop {
             mapper_name: mapper_name.clone(),
             mount_point: mount_point.to_string(),
         };
-        let key = b"persistent-test-data-encryption-key";
+        let key = TEST_PERSISTENT_KEY;
 
-        persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(key.to_vec()),
-                volume_id.clone(),
-            )
+        activate_and_mount_test_volume(device.dev_path(), mount_point, key, binding.clone())
             .await
             .unwrap();
         let (status, _) = run_command(CRYPTSETUP_BIN, &["status", &mapper_name], None).unwrap();
@@ -2120,7 +2494,7 @@ mod tests {
             .close_device(&mapper_name)
             .unwrap();
         assert_eq!(
-            persistent_state(device.dev_path(), key, &volume_id),
+            persistent_state(device.dev_path(), key, &binding),
             PersistentLuksState::Ready
         );
 
@@ -2134,16 +2508,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            persistent_state(device.dev_path(), key, &volume_id),
+            persistent_state(device.dev_path(), key, &binding),
             PersistentLuksState::Initializing
         );
-        persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(key.to_vec()),
-                volume_id.clone(),
-            )
+        activate_and_mount_test_volume(device.dev_path(), mount_point, key, binding.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -2155,19 +2523,15 @@ mod tests {
             .close_device(&mapper_name)
             .unwrap();
         assert_eq!(
-            persistent_state(device.dev_path(), key, &volume_id),
+            persistent_state(device.dev_path(), key, &binding),
             PersistentLuksState::Ready
         );
 
-        assert!(persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(b"wrong key".to_vec()),
-                volume_id,
-            )
-            .await
-            .is_err());
+        assert!(
+            activate_test_volume(device.dev_path(), &[0x5a; 32], binding)
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2178,21 +2542,15 @@ mod tests {
         let device = TempFileLoopDevice::new(128 * 1024 * 1024).unwrap();
         let mount_directory = tempfile::tempdir().unwrap();
         let mount_point = mount_directory.path().to_str().unwrap();
-        let volume_id = PersistentVolumeId::try_from("tenant/workload/tamper-test").unwrap();
-        let mapper_name = volume_id.mapper_name();
+        let binding = persistent_binding("tenant/workload/tamper-test");
+        let mapper_name = binding.mapper_name();
         let _resources = PersistentResourcesOnDrop {
             mapper_name: mapper_name.clone(),
             mount_point: mount_point.to_string(),
         };
-        let key = b"persistent-header-tamper-test-key";
+        let key = TEST_PERSISTENT_KEY;
 
-        persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(key.to_vec()),
-                volume_id.clone(),
-            )
+        activate_and_mount_test_volume(device.dev_path(), mount_point, key, binding.clone())
             .await
             .unwrap();
         nix::mount::umount(mount_point).unwrap();
@@ -2206,13 +2564,7 @@ mod tests {
         device_file.read_exact_at(&mut byte, tamper_offset).unwrap();
         byte[0] ^= 1;
         device_file.write_all_at(&byte, tamper_offset).unwrap();
-        let error = persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(key.to_vec()),
-                volume_id,
-            )
+        let error = activate_test_volume(device.dev_path(), key, binding)
             .await
             .unwrap_err();
 
@@ -2226,14 +2578,12 @@ mod tests {
     #[serial]
     async fn interrupted_persistent_integrity_format_fails_without_mutation() {
         let device = TempFileLoopDevice::new(128 * 1024 * 1024).unwrap();
-        let mount_directory = tempfile::tempdir().unwrap();
-        let mount_point = mount_directory.path().to_str().unwrap();
-        let volume_id = PersistentVolumeId::try_from("tenant/workload/interrupted-format").unwrap();
-        let mapper_name = volume_id.mapper_name();
-        let key = b"persistent-interrupted-format-test-key";
+        let binding = persistent_binding("tenant/workload/interrupted-format");
+        let mapper_name = binding.mapper_name();
+        let key = TEST_PERSISTENT_KEY;
         let source = open_persistent_device(device.dev_path()).unwrap();
-        let auth_key = derive_persistent_auth_key(key, &volume_id).unwrap();
-        let prepared = PersistentMetadataRecord::prepared(&volume_id);
+        let auth_key = derive_persistent_auth_key(key, &binding).unwrap();
+        let prepared = PersistentMetadataRecord::prepared(&binding);
         store_persistent_metadata(&source, &prepared, &auth_key).unwrap();
 
         // cryptsetup writes the dm-integrity superblock before it can return a
@@ -2245,13 +2595,7 @@ mod tests {
         source.sync_all().unwrap();
         let before = device_digest(device.dev_path());
 
-        let error = persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(key.to_vec()),
-                volume_id,
-            )
+        let error = activate_test_volume(device.dev_path(), key, binding)
             .await
             .unwrap_err();
 
@@ -2269,23 +2613,17 @@ mod tests {
         let device = TempFileLoopDevice::new(128 * 1024 * 1024).unwrap();
         let mount_directory = tempfile::tempdir().unwrap();
         let mount_point = mount_directory.path().to_str().unwrap();
-        let volume_id = PersistentVolumeId::try_from("tenant/workload/payload-tamper").unwrap();
-        let mapper_name = volume_id.mapper_name();
+        let binding = persistent_binding("tenant/workload/payload-tamper");
+        let mapper_name = binding.mapper_name();
         let mapper_path = format!("/dev/mapper/{mapper_name}");
         let _resources = PersistentResourcesOnDrop {
             mapper_name: mapper_name.clone(),
             mount_point: mount_point.to_string(),
         };
-        let key = b"persistent-payload-tamper-test-key";
+        let key = TEST_PERSISTENT_KEY;
         let formatter = Luks2Formatter::default().with_integrity(true);
 
-        persistent_parameters()
-            .do_mount_persistent(
-                device.dev_path(),
-                mount_point,
-                Zeroizing::new(key.to_vec()),
-                volume_id.clone(),
-            )
+        activate_and_mount_test_volume(device.dev_path(), mount_point, key, binding.clone())
             .await
             .unwrap();
         nix::mount::umount(mount_point).unwrap();
@@ -2313,15 +2651,15 @@ mod tests {
         device_file.sync_all().unwrap();
 
         let source = open_persistent_device(device.dev_path()).unwrap();
-        let auth_key = derive_persistent_auth_key(key, &volume_id).unwrap();
-        let record = load_persistent_metadata(&source, &auth_key, &volume_id)
+        let auth_key = derive_persistent_auth_key(key, &binding).unwrap();
+        let record = load_persistent_metadata(&source, &auth_key, &binding)
             .unwrap()
             .unwrap();
-        let header = load_verified_header(&source, &record, &auth_key, &volume_id).unwrap();
+        let header = load_verified_header(&source, &record, &auth_key, &binding).unwrap();
         formatter
-            .open_device(
+            .open_persistent_device(
                 device.dev_path(),
-                Some(header.path().to_str().unwrap()),
+                header.path().to_str().unwrap(),
                 &mapper_name,
                 key,
             )
@@ -2371,56 +2709,56 @@ mod tests {
             let device = TempFileLoopDevice::new(128 * 1024 * 1024).unwrap();
             let mount_directory = tempfile::tempdir().unwrap();
             let mount_point = mount_directory.path().to_str().unwrap();
-            let volume_id =
-                PersistentVolumeId::try_from(format!("tenant/workload/crash-{index}").as_str())
-                    .unwrap();
-            let mapper_name = volume_id.mapper_name();
+            let binding = persistent_binding(format!("tenant/workload/crash-{index}").as_str());
+            let mapper_name = binding.mapper_name();
             let mapper_path = format!("/dev/mapper/{mapper_name}");
             let _resources = PersistentResourcesOnDrop {
                 mapper_name: mapper_name.clone(),
                 mount_point: mount_point.to_string(),
             };
-            let key = b"persistent-crash-boundary-test-key";
+            let key = TEST_PERSISTENT_KEY;
             let formatter = Luks2Formatter::default().with_integrity(true);
             let mut expect_sentinel = false;
 
             if matches!(boundary, PersistentCrashBoundary::AfterReadyMetadata) {
-                persistent_parameters()
-                    .do_mount_persistent(
-                        device.dev_path(),
-                        mount_point,
-                        Zeroizing::new(key.to_vec()),
-                        volume_id.clone(),
-                    )
-                    .await
-                    .unwrap();
+                activate_and_mount_test_volume(
+                    device.dev_path(),
+                    mount_point,
+                    key,
+                    binding.clone(),
+                )
+                .await
+                .unwrap();
                 std::fs::write(mount_directory.path().join("sentinel"), b"preserve me").unwrap();
                 expect_sentinel = true;
                 nix::mount::umount(mount_point).unwrap();
                 formatter.close_device(&mapper_name).unwrap();
             } else if !matches!(boundary, PersistentCrashBoundary::BeforeMetadata) {
-                let device_file = open_persistent_device(device.dev_path()).unwrap();
-                let auth_key = derive_persistent_auth_key(key, &volume_id).unwrap();
-                let prepared = PersistentMetadataRecord::prepared(&volume_id);
-                store_persistent_metadata(&device_file, &prepared, &auth_key).unwrap();
+                let pinned_device = PinnedPersistentDevice::open(
+                    device.dev_path(),
+                    block_device_number(device.dev_path()).unwrap(),
+                )
+                .unwrap();
+                let auth_key = derive_persistent_auth_key(key, &binding).unwrap();
+                let prepared = PersistentMetadataRecord::prepared(&binding);
+                store_persistent_metadata(&pinned_device.file, &prepared, &auth_key).unwrap();
 
                 if !matches!(boundary, PersistentCrashBoundary::AfterPreparedMetadata) {
                     let (header, _) = initialize_persistent_header(
-                        device.dev_path(),
-                        &device_file,
+                        &pinned_device,
                         &prepared,
                         &auth_key,
                         key,
-                        &volume_id,
-                        None,
+                        &binding,
+                        Some(TEST_LUKS_UUID),
                     )
                     .unwrap();
 
                     if !matches!(boundary, PersistentCrashBoundary::AfterHeaderCommit) {
                         formatter
-                            .open_device(
+                            .open_persistent_device(
                                 device.dev_path(),
-                                Some(header.path().to_str().unwrap()),
+                                header.path().to_str().unwrap(),
                                 &mapper_name,
                                 key,
                             )
@@ -2451,18 +2789,12 @@ mod tests {
                 }
             }
 
-            persistent_parameters()
-                .do_mount_persistent(
-                    device.dev_path(),
-                    mount_point,
-                    Zeroizing::new(key.to_vec()),
-                    volume_id.clone(),
-                )
+            activate_and_mount_test_volume(device.dev_path(), mount_point, key, binding.clone())
                 .await
                 .unwrap_or_else(|error| panic!("recovery from {boundary:?} failed: {error:#}"));
 
             assert_eq!(
-                persistent_state(device.dev_path(), key, &volume_id),
+                persistent_state(device.dev_path(), key, &binding),
                 PersistentLuksState::Ready,
                 "wrong state after recovering {boundary:?}"
             );
@@ -2534,9 +2866,8 @@ mod tests {
             .write_all(&vec![0; 20 * 1024 * 1024])
             .unwrap();
         let path = bin_file.path().to_str().unwrap();
-        let header_path = luks_header_path(path);
+        let (_header_directory, header_path) = temporary_header_path();
         prepare_luks_header_file(&header_path).unwrap();
-        let _guard = RemoveHeaderOnDrop(header_path.clone());
 
         let passphrase = Zeroizing::new(TEST_PASSPHRASE.to_vec());
         let luks2_formatter = Luks2Formatter { integrity: false };
@@ -2560,9 +2891,8 @@ mod tests {
             .write_all(&vec![0; 20 * 1024 * 1024])
             .unwrap();
         let path = bin_file.path().to_str().unwrap();
-        let header_path = luks_header_path(path);
+        let (_header_directory, header_path) = temporary_header_path();
         prepare_luks_header_file(&header_path).unwrap();
-        let _guard = RemoveHeaderOnDrop(header_path.clone());
 
         let passphrase = Zeroizing::new(TEST_PASSPHRASE.to_vec());
         let luks2_formatter = Luks2Formatter { integrity: true };
@@ -2585,9 +2915,8 @@ mod tests {
             .write_all(&vec![0; 20 * 1024 * 1024])
             .unwrap();
         let path = bin_file.path().to_str().unwrap();
-        let header_path = luks_header_path(path);
+        let (_header_directory, header_path) = temporary_header_path();
         prepare_luks_header_file(&header_path).unwrap();
-        let _guard = RemoveHeaderOnDrop(header_path.clone());
 
         let passphrase = Zeroizing::new(TEST_PASSPHRASE.to_vec());
         let luks2_formatter = Luks2Formatter { integrity: false };
@@ -2604,9 +2933,8 @@ mod tests {
             .write_all(&vec![0; 20 * 1024 * 1024])
             .unwrap();
         let path = bin_file.path().to_str().unwrap();
-        let header_path = luks_header_path(path);
+        let (_header_directory, header_path) = temporary_header_path();
         prepare_luks_header_file(&header_path).unwrap();
-        let _guard = RemoveHeaderOnDrop(header_path.clone());
 
         let passphrase = Zeroizing::new(TEST_PASSPHRASE.to_vec());
         let luks2_formatter = Luks2Formatter { integrity: false };
@@ -2623,18 +2951,7 @@ mod tests {
 
     #[test]
     fn prepare_luks_header_file_rejects_existing_path() {
-        use rand::{distr::Alphanumeric, rng, RngExt};
-
-        let path_str = format!(
-            "/dev/{}",
-            rng()
-                .sample_iter(&Alphanumeric)
-                .take(16)
-                .map(char::from)
-                .collect::<String>()
-        );
-
-        let header_path = luks_header_path(&path_str);
+        let (_header_directory, header_path) = temporary_header_path();
         prepare_luks_header_file(&header_path).unwrap();
         let result = prepare_luks_header_file(&header_path);
 
@@ -2642,7 +2959,6 @@ mod tests {
             Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists),
             other => panic!("unexpected result: {other:?}"),
         }
-        let _ = std::fs::remove_file(&header_path);
     }
 
     /// This test can be used to clean useless devices under /dev/mapper/

@@ -83,9 +83,8 @@ pub enum SourceType {
     #[serde(rename = "empty")]
     Empty,
 
-    /// The source is a persistent LUKS2 device. CDH authenticates its detached
-    /// header before cryptsetup may use it. A new device is initialized only
-    /// after a complete zero scan.
+    /// Reserved legacy spelling. The free-form secure-mount boundary rejects
+    /// this value; persistent storage uses SecureVolumeService.
     #[serde(rename = "persistent")]
     Persistent,
 }
@@ -114,8 +113,7 @@ pub struct BlockDeviceParameters {
 
     /// The key to encrypt or decrypt the device.
     ///
-    /// If not set, legacy source types generate a random 4096-byte key.
-    /// Persistent source types require an explicit key reference.
+    /// If not set, CDH generates a random 4096-byte key.
     ///
     /// Legal values are starting with:
     /// - "sealed.": Get the encryption key from the sealed secret.
@@ -123,113 +121,18 @@ pub struct BlockDeviceParameters {
     /// - "file://": Get the encryption key from the local file.
     pub key: Option<String>,
 
-    /// Stable caller-provided identity for a persistent volume.
-    ///
-    /// This is required when `sourceType` is `persistent`. CDH binds its
-    /// authenticated metadata and device-mapper name to this value so transient
-    /// guest device paths do not become persistent identity.
-    #[serde(rename = "volumeId")]
-    pub volume_id: Option<String>,
-
     /// The encryption type. Currently, only LUKS is supported.
     #[serde(flatten)]
     pub encryption_type: BlockDeviceEncryptType,
 }
 
-const MAX_KEY_REFERENCE_BYTES: usize = 64 * 1024;
-const PERSISTENT_OPTION_KEYS: [&str; 11] = [
-    "deviceId",
-    "devicePath",
-    "sourceType",
-    "key",
-    "volumeId",
-    "encryptionType",
-    "dataIntegrity",
-    "mapperName",
-    "targetType",
-    "filesystemType",
-    "mkfsOpts",
-];
-
-fn is_supported_key_reference(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= MAX_KEY_REFERENCE_BYTES
-        && (key.starts_with("sealed.") || key.starts_with("kbs://") || key.starts_with("file://"))
-}
-
-fn validate_persistent_option_keys(options: &HashMap<String, String>) -> Result<()> {
+fn reject_legacy_persistent_mode(options: &HashMap<String, String>) -> Result<()> {
     if options.get("sourceType").map(String::as_str) != Some("persistent") {
         return Ok(());
     }
-
-    if options
-        .keys()
-        .any(|key| !PERSISTENT_OPTION_KEYS.contains(&key.as_str()))
-    {
-        return Err(BlockDeviceError::InvalidPersistentConfiguration {
-            reason: "persistent source type contains an unsupported option",
-        });
-    }
-
-    Ok(())
-}
-
-fn validate_persistent_parameters(
-    parameters: &BlockDeviceParameters,
-    mount_point: &str,
-) -> Result<Option<crate::storage::drivers::luks2::PersistentVolumeId>> {
-    if parameters.source_type != SourceType::Persistent {
-        return Ok(None);
-    }
-
-    let key =
-        parameters
-            .key
-            .as_deref()
-            .ok_or(BlockDeviceError::InvalidPersistentConfiguration {
-                reason: "key is required",
-            })?;
-    if !is_supported_key_reference(key) {
-        return Err(BlockDeviceError::InvalidPersistentConfiguration {
-            reason: "key must be a bounded sealed.*, kbs://, or file:// reference",
-        });
-    }
-
-    if !is_safe_absolute_path(mount_point) {
-        return Err(BlockDeviceError::InvalidPersistentConfiguration {
-            reason: "mount point must be a normalized absolute path",
-        });
-    }
-
-    let BlockDeviceEncryptType::Luks2(luks2) = &parameters.encryption_type else {
-        return Err(BlockDeviceError::InvalidPersistentConfiguration {
-            reason: "persistent source type is only supported with LUKS2",
-        });
-    };
-    luks2
-        .validate_persistent()
-        .map_err(|reason| BlockDeviceError::InvalidPersistentConfiguration { reason })?;
-
-    let volume_id = parameters.volume_id.as_deref().ok_or(
-        BlockDeviceError::InvalidPersistentConfiguration {
-            reason: "volumeId is required",
-        },
-    )?;
-    crate::storage::drivers::luks2::PersistentVolumeId::try_from(volume_id)
-        .map(Some)
-        .map_err(|_| BlockDeviceError::InvalidPersistentVolumeId)
-}
-
-fn is_safe_absolute_path(path: &str) -> bool {
-    let path = std::path::Path::new(path);
-    path.is_absolute()
-        && path != std::path::Path::new("/")
-        && path.components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::RootDir | std::path::Component::Normal(_)
-            )
-        })
+    Err(BlockDeviceError::InvalidPersistentConfiguration {
+        reason: "persistent storage requires the typed SecureVolumeService contract",
+    })
 }
 
 #[derive(Default)]
@@ -260,20 +163,14 @@ impl BlockDevice {
         _flags: &[String],
         mount_point: &str,
     ) -> Result<()> {
-        // Legacy modes historically ignored extra fields. Persistent mode can
-        // initialize a device, so reject an option the implementation does not
-        // understand before deserialization can silently discard it.
-        validate_persistent_option_keys(options)?;
+        // The legacy free-form secure_mount request cannot carry the measured
+        // manifest digest or crypto profile. Persistent activation is therefore
+        // accepted only by the typed SecureVolumeService.
+        reject_legacy_persistent_mode(options)?;
 
         // construct BlockDeviceParameters
         let parameters = serde_json::to_string(options)?;
         let parameters: BlockDeviceParameters = serde_json::from_str(&parameters)?;
-
-        // Persistent mode is the only mode that can provision and later reopen
-        // the same device. Validate its destructive-operation authority before
-        // resolving or reading the device and before retrieving the plaintext
-        // key.
-        let persistent_volume_id = validate_persistent_parameters(&parameters, mount_point)?;
 
         // 1. get the source device path
         let device_path = match (parameters.device_id, parameters.device_path) {
@@ -306,20 +203,10 @@ impl BlockDevice {
                 } else {
                     self.mount_points.push(mount_point.to_string());
                 }
-                if let Some(volume_id) = persistent_volume_id {
-                    let mapper_name = volume_id.mapper_name();
-                    luks2_parameters
-                        .do_mount_persistent(&device_path, mount_point, key, volume_id)
-                        .await
-                        .map_err(|source| BlockDeviceError::Luks2Error { source })?;
-                    self.cryptsetup_pairs
-                        .push((device_path.clone(), mapper_name));
-                } else {
-                    luks2_parameters
-                        .do_mount(&device_path, mount_point, key, parameters.source_type)
-                        .await
-                        .map_err(|source| BlockDeviceError::Luks2Error { source })?;
-                }
+                luks2_parameters
+                    .do_mount(&device_path, mount_point, key, parameters.source_type)
+                    .await
+                    .map_err(|source| BlockDeviceError::Luks2Error { source })?;
             }
             BlockDeviceEncryptType::Zfs(zfs_parameters) => {
                 self.zfs_pools.push(zfs_parameters.pool.clone());
@@ -431,10 +318,6 @@ mod tests {
 
     const EXT4_INTEGRITY_MKFS_OPTS: &str = "-O ^has_journal -m 0 -i 163840 -I 128";
 
-    fn parse_block_device_parameters(options: &HashMap<String, String>) -> BlockDeviceParameters {
-        serde_json::from_str(&serde_json::to_string(options).unwrap()).unwrap()
-    }
-
     fn persistent_options() -> HashMap<String, String> {
         HashMap::from([
             ("sourceType".to_string(), "persistent".to_string()),
@@ -475,90 +358,10 @@ mod tests {
     }
 
     #[test]
-    fn persistent_boundary_validation_fails_closed() {
+    fn legacy_persistent_mode_requires_typed_service() {
         let options = persistent_options();
-        validate_persistent_option_keys(&options).unwrap();
-        let parameters = parse_block_device_parameters(&options);
-        let volume_id = validate_persistent_parameters(&parameters, "/run/cdh/web-data")
-            .unwrap()
-            .unwrap();
-        let same_volume_id =
-            crate::storage::drivers::luks2::PersistentVolumeId::try_from("tenant/example/web-data")
-                .unwrap();
-        assert_eq!(volume_id.mapper_name(), same_volume_id.mapper_name());
-
-        let mut invalid = persistent_options();
-        invalid.remove("key");
-        assert!(validate_persistent_parameters(
-            &parse_block_device_parameters(&invalid),
-            "/run/cdh/web-data"
-        )
-        .is_err());
-
-        let mut invalid = persistent_options();
-        invalid.insert("key".to_string(), "https://example.invalid/key".to_string());
-        assert!(validate_persistent_parameters(
-            &parse_block_device_parameters(&invalid),
-            "/run/cdh/web-data"
-        )
-        .is_err());
-
-        let mut invalid = persistent_options();
-        invalid.remove("volumeId");
-        assert!(validate_persistent_parameters(
-            &parse_block_device_parameters(&invalid),
-            "/run/cdh/web-data"
-        )
-        .is_err());
-
-        let mut invalid = persistent_options();
-        invalid.insert("volumeId".to_string(), "../not-canonical".to_string());
-        assert!(validate_persistent_parameters(
-            &parse_block_device_parameters(&invalid),
-            "/run/cdh/web-data"
-        )
-        .is_err());
-
-        for (name, value) in [
-            ("mapperName", "caller-controlled"),
-            ("mkfsOpts", "-F /dev/other"),
-            ("dataIntegrity", "false"),
-        ] {
-            let mut invalid = persistent_options();
-            invalid.insert(name.to_string(), value.to_string());
-            assert!(validate_persistent_parameters(
-                &parse_block_device_parameters(&invalid),
-                "/run/cdh/web-data"
-            )
-            .is_err());
-        }
-
-        let mut invalid = persistent_options();
-        invalid.insert("targetType".to_string(), "device".to_string());
-        invalid.remove("filesystemType");
-        assert!(validate_persistent_parameters(
-            &parse_block_device_parameters(&invalid),
-            "/run/cdh/web-data"
-        )
-        .is_err());
-
-        let mut invalid = persistent_options();
-        invalid.insert("encryptionType".to_string(), "zfs".to_string());
-        invalid.remove("targetType");
-        invalid.remove("filesystemType");
-        assert!(validate_persistent_parameters(
-            &parse_block_device_parameters(&invalid),
-            "/run/cdh/web-data"
-        )
-        .is_err());
-
-        assert!(validate_persistent_parameters(&parameters, "relative/path").is_err());
-        assert!(validate_persistent_parameters(&parameters, "/").is_err());
-        assert!(validate_persistent_parameters(&parameters, "/run/../etc").is_err());
-
-        let mut unknown = persistent_options();
-        unknown.insert("grow".to_string(), "true".to_string());
-        assert!(validate_persistent_option_keys(&unknown).is_err());
+        let error = reject_legacy_persistent_mode(&options).unwrap_err();
+        assert!(error.to_string().contains("typed SecureVolumeService"));
     }
 
     #[test]
@@ -569,12 +372,7 @@ mod tests {
             options.remove("volumeId");
             options.insert("key".to_string(), "file://legacy-key".to_string());
             options.insert("legacyIgnoredField".to_string(), "value".to_string());
-            validate_persistent_option_keys(&options).unwrap();
-            let parameters = parse_block_device_parameters(&options);
-            assert_eq!(
-                validate_persistent_parameters(&parameters, "/legacy/mount").unwrap(),
-                None
-            );
+            reject_legacy_persistent_mode(&options).unwrap();
         }
     }
 

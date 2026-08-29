@@ -16,13 +16,15 @@ use zeroize::Zeroizing;
 
 use crate::storage::{
     drivers::luks2::{
-        activate_persistent_ext4, Luks2Formatter, PersistentActivation, PersistentVolumeId,
+        activate_persistent_ext4, DeviceNumber, Luks2Formatter, PersistentActivation,
+        PersistentVolumeBinding, PersistentVolumeId, PERSISTENT_KEY_BYTES,
+        PERSISTENT_PROFILE_VERSION,
     },
     volume_type::blockdevice::{get_device_path, parse_device_id},
 };
 
 const MAX_MANIFEST_SIZE: usize = 64 * 1024;
-const SUPPORTED_SCHEMA_VERSION: u32 = 2;
+const SUPPORTED_SCHEMA_VERSION: u32 = 3;
 const SUPPORTED_PROTECTION_TYPE: &str = "luks2-integrity-rw";
 const SHA256_TAG_PREFIX: &str = "sha256-";
 
@@ -41,6 +43,9 @@ pub enum Error {
 
     #[error("secure-volume recovery key digest does not match manifest")]
     KeyDigestMismatch,
+
+    #[error("secure-volume recovery key must contain exactly {PERSISTENT_KEY_BYTES} binary bytes")]
+    InvalidKeyLength,
 
     #[error("invalid secure-volume manifest: {0}")]
     InvalidManifest(String),
@@ -74,6 +79,7 @@ impl Error {
             Self::ManifestParse(_) => ("manifest_validation", "invalid_json"),
             Self::ManifestDigestMismatch => ("manifest_validation", "digest_mismatch"),
             Self::KeyDigestMismatch => ("key_validation", "digest_mismatch"),
+            Self::InvalidKeyLength => ("key_validation", "invalid_length"),
             Self::InvalidManifest(_) => ("manifest_validation", "invalid_manifest"),
             Self::InvalidDevice(_) => ("device_resolution", "invalid_device"),
             Self::AccessMismatch { .. } => ("access_validation", "mismatch"),
@@ -110,6 +116,8 @@ pub struct Manifest {
     pub device_size_bytes: u64,
     pub access: VolumeAccess,
     pub protection: Protection,
+    #[serde(skip)]
+    manifest_digest: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -117,6 +125,7 @@ pub struct Manifest {
 pub struct Protection {
     #[serde(rename = "type")]
     pub protection_type: String,
+    pub profile_version: u32,
     pub key_uri: String,
     pub key_sha256: String,
     pub luks_uuid: String,
@@ -154,7 +163,9 @@ impl Manifest {
             return Err(Error::ManifestDigestMismatch);
         }
 
-        Self::parse(bytes)
+        let mut manifest = Self::parse(bytes)?;
+        manifest.manifest_digest = Some(Sha256::digest(bytes).into());
+        Ok(manifest)
     }
 
     fn validate(&self) -> Result<()> {
@@ -179,6 +190,12 @@ impl Manifest {
                 self.protection.protection_type
             )));
         }
+        if self.protection.profile_version != PERSISTENT_PROFILE_VERSION {
+            return Err(Error::InvalidManifest(format!(
+                "unsupported profileVersion {}",
+                self.protection.profile_version
+            )));
+        }
         validate_kbs_resource_uri(&self.protection.key_uri)?;
         if !canonical_sha256(&self.protection.key_sha256) {
             return Err(Error::InvalidManifest(
@@ -198,10 +215,30 @@ impl Manifest {
 
     /// Verify the recovery key before the device is resolved or mutated.
     pub fn verify_key(&self, key: &[u8]) -> Result<()> {
+        if key.len() != PERSISTENT_KEY_BYTES {
+            return Err(Error::InvalidKeyLength);
+        }
         if sha256_hex(key) != self.protection.key_sha256 {
             return Err(Error::KeyDigestMismatch);
         }
         Ok(())
+    }
+
+    fn persistent_binding(&self) -> Result<PersistentVolumeBinding> {
+        let manifest_digest = self.manifest_digest.ok_or_else(|| {
+            Error::InvalidManifest(
+                "manifest must be digest-bound before volume activation".to_string(),
+            )
+        })?;
+        let volume_id = PersistentVolumeId::try_from(self.volume_id.as_str())
+            .map_err(|error| Error::InvalidManifest(error.to_string()))?;
+        PersistentVolumeBinding::new(
+            volume_id,
+            &self.volume_version,
+            manifest_digest,
+            self.protection.profile_version,
+        )
+        .map_err(|error| Error::InvalidManifest(error.to_string()))
     }
 
     pub fn ensure_access(&self, requested: VolumeAccess) -> Result<()> {
@@ -301,12 +338,13 @@ impl Manager {
 
         let (major, minor) = parse_device_id(device_id)
             .map_err(|error| Error::InvalidDevice(format!("invalid device ID: {error}")))?;
+        let expected_device = DeviceNumber::new(u64::from(major), u64::from(minor));
         let device_id = format!("{major}:{minor}");
         let device_path = get_device_path(major, minor).await.map_err(|error| {
             Error::InvalidDevice(format!("cannot resolve {device_id}: {error}"))
         })?;
-        let volume_id = PersistentVolumeId::try_from(manifest.volume_id.as_str())
-            .map_err(|error| Error::InvalidManifest(error.to_string()))?;
+        manifest.verify_key(&key)?;
+        let binding = manifest.persistent_binding()?;
         let activation_id = Uuid::new_v4().to_string();
 
         self.registry.lock().await.reserve(
@@ -318,7 +356,8 @@ impl Manager {
         let result = self
             .activate_reserved(
                 &device_path,
-                volume_id,
+                expected_device,
+                binding,
                 &manifest.protection.luks_uuid,
                 manifest.device_size_bytes,
                 key,
@@ -356,14 +395,22 @@ impl Manager {
     async fn activate_reserved(
         &self,
         device_path: &str,
-        volume_id: PersistentVolumeId,
+        expected_device: DeviceNumber,
+        binding: PersistentVolumeBinding,
         luks_uuid: &str,
         expected_size_bytes: u64,
         key: Zeroizing<Vec<u8>>,
     ) -> Result<PersistentActivation> {
-        activate_persistent_ext4(device_path, key, volume_id, luks_uuid, expected_size_bytes)
-            .await
-            .map_err(Error::Activation)
+        activate_persistent_ext4(
+            device_path,
+            expected_device,
+            key,
+            binding,
+            luks_uuid,
+            expected_size_bytes,
+        )
+        .await
+        .map_err(Error::Activation)
     }
 
     /// Deactivation is idempotent. An unknown handle has no resources to release.
@@ -420,18 +467,19 @@ fn validate_identifier(field: &str, value: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    const KEY: &[u8] = b"test recovery key material";
+    const KEY: &[u8; PERSISTENT_KEY_BYTES] = b"0123456789abcdef0123456789abcdef";
 
     fn valid_manifest() -> Vec<u8> {
         format!(
             r#"{{
-          "schemaVersion": 2,
+          "schemaVersion": 3,
           "volumeId": "tenant/workload/volume-1",
           "volumeVersion": "volume-1-v2",
           "deviceSizeBytes": 1073741824,
           "access": "readWrite",
           "protection": {{
             "type": "luks2-integrity-rw",
+            "profileVersion": 1,
             "keyUri": "kbs:///tenant/storage-keys/volume-1-v1",
             "keySha256": "{}",
             "luksUuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -454,6 +502,7 @@ mod tests {
         let bytes = valid_manifest();
         let manifest = Manifest::parse_bound(&bytes, &manifest_uri(&bytes)).unwrap();
         manifest.verify_key(KEY).unwrap();
+        manifest.persistent_binding().unwrap();
         manifest.ensure_access(VolumeAccess::ReadWrite).unwrap();
     }
 
@@ -472,6 +521,12 @@ mod tests {
         let manifest = Manifest::parse_bound(&bytes, &uri).unwrap();
         assert!(matches!(
             manifest.verify_key(b"substituted recovery key"),
+            Err(Error::InvalidKeyLength)
+        ));
+
+        let wrong_key = [0x5a; PERSISTENT_KEY_BYTES];
+        assert!(matches!(
+            manifest.verify_key(&wrong_key),
             Err(Error::KeyDigestMismatch)
         ));
     }
@@ -511,6 +566,26 @@ mod tests {
             .replace("luks2-integrity-rw", "luks2-rw");
         assert!(matches!(
             Manifest::parse(bytes.as_bytes()),
+            Err(Error::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_profile_version() {
+        let bytes = String::from_utf8(valid_manifest())
+            .unwrap()
+            .replace("\"profileVersion\": 1", "\"profileVersion\": 2");
+        assert!(matches!(
+            Manifest::parse(bytes.as_bytes()),
+            Err(Error::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
+    fn unbound_manifest_cannot_authorize_activation() {
+        let manifest = Manifest::parse(&valid_manifest()).unwrap();
+        assert!(matches!(
+            manifest.persistent_binding(),
             Err(Error::InvalidManifest(_))
         ));
     }
