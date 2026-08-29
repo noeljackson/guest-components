@@ -65,8 +65,10 @@ Before first use, CDH performs these checks in order:
    LUKS UUID, key URI, key length, and key digest.
 2. It resolves the declared major/minor, opens that exact block device, and
    keeps the descriptor for the whole activation. Internal reads and writes use
-   the held descriptor. Every unavoidable `cryptsetup` pathname operation is
-   bracketed by device-identity checks.
+   the held descriptor. Each persistent `cryptsetup` command inherits that
+   descriptor and receives `/proc/self/fd/<n>` as its device argument, so a
+   devnode swap cannot redirect the command. Path identity checks before and
+   after the command remain defense in depth, not the binding mechanism.
 3. It serializes activations by major/minor and scans the complete new device.
    A device without authenticated CDH metadata must be entirely zero.
 4. It formats the fixed profile, copies the complete detached header into the
