@@ -45,7 +45,7 @@ use zeroize::Zeroizing;
 
 use crate::hub::CDH_BASE_DIR;
 use crate::storage::drivers::filesystem::{FsFormatter, FsType};
-use crate::storage::drivers::{run_command, run_command_output};
+use crate::storage::drivers::{run_command, run_command_output, run_command_with_inherited_file};
 use crate::storage::volume_type::blockdevice::SourceType;
 
 /// Algorithm of the integrity hash (dm-integrity format name)
@@ -310,6 +310,15 @@ impl PinnedPersistentDevice {
             bail!("persistent block-device path no longer names the opened device")
         }
         Ok(identity)
+    }
+
+    fn cryptsetup_argument(&self) -> String {
+        format!("/proc/self/fd/{}", self.file.as_raw_fd())
+    }
+
+    fn run_cryptsetup(&self, args: &[&str], input: Option<&[u8]>) -> Result<(String, String)> {
+        run_command_with_inherited_file(CRYPTSETUP_BIN, args, input, &self.file)
+            .context("run cryptsetup against pinned persistent device")
     }
 
     fn run_path_operation<T>(
@@ -685,6 +694,30 @@ impl Luks2Formatter {
         Ok(())
     }
 
+    fn encrypt_persistent_device_with_payload_alignment(
+        &self,
+        device: &PinnedPersistentDevice,
+        header_path: &str,
+        payload_alignment_sectors: u64,
+        luks_uuid: Option<&str>,
+        passphrase: &[u8],
+    ) -> anyhow::Result<()> {
+        let device_argument = device.cryptsetup_argument();
+        let args = luks_format_arguments(
+            self.integrity,
+            &device_argument,
+            Some(header_path),
+            Some(payload_alignment_sectors),
+            luks_uuid,
+            IntegrityInitialization::CompleteWithJournal,
+        );
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        device
+            .run_cryptsetup(&args, Some(passphrase))
+            .context("cryptsetup persistent luksFormat failed")?;
+        Ok(())
+    }
+
     /// Open a LUKS2 device using the `cryptsetup` binary.
     pub fn open_device(
         &self,
@@ -707,11 +740,12 @@ impl Luks2Formatter {
 
     fn open_persistent_device(
         &self,
-        device_path: &str,
+        device: &PinnedPersistentDevice,
         header_path: &str,
         name: &str,
         key: &[u8],
     ) -> anyhow::Result<()> {
+        let device_argument = device.cryptsetup_argument();
         let args = [
             "luksOpen",
             "--header",
@@ -720,18 +754,22 @@ impl Luks2Formatter {
             PERSISTENT_KEYFILE_BYTES,
             "-d",
             "-",
-            device_path,
+            &device_argument,
             name,
         ];
-        run_cryptsetup_stdin(&args, key).context("cryptsetup persistent luksOpen failed")
+        device
+            .run_cryptsetup(&args, Some(key))
+            .context("cryptsetup persistent luksOpen failed")?;
+        Ok(())
     }
 
     fn test_persistent_passphrase(
         &self,
-        device_path: &str,
+        device: &PinnedPersistentDevice,
         header_path: &str,
         key: &[u8],
     ) -> anyhow::Result<()> {
+        let device_argument = device.cryptsetup_argument();
         let args = [
             "open",
             "--test-passphrase",
@@ -741,10 +779,12 @@ impl Luks2Formatter {
             PERSISTENT_KEYFILE_BYTES,
             "--header",
             header_path,
-            device_path,
+            &device_argument,
         ];
-        run_cryptsetup_stdin(&args, key)
-            .context("cryptsetup persistent passphrase verification failed")
+        device
+            .run_cryptsetup(&args, Some(key))
+            .context("cryptsetup persistent passphrase verification failed")?;
+        Ok(())
     }
 
     /// Close a LUKS2 mapping using the `cryptsetup` binary.
@@ -1156,12 +1196,11 @@ fn initialize_persistent_header(
     );
     device.run_path_operation(PersistentPathOperation::Format, || {
         formatter
-            .encrypt_device_with_payload_alignment(
-                &device.path,
-                Some(header_path),
-                Some(PERSISTENT_DATA_OFFSET_SECTORS),
+            .encrypt_persistent_device_with_payload_alignment(
+                device,
+                header_path,
+                PERSISTENT_DATA_OFFSET_SECTORS,
                 luks_uuid,
-                IntegrityInitialization::CompleteWithJournal,
                 key,
             )
             .context("create detached persistent LUKS2 header")
@@ -1260,12 +1299,13 @@ fn validate_luks_uuid(
     expected: &str,
 ) -> Result<()> {
     device.run_path_operation(PersistentPathOperation::ReadUuid, || {
-        let (stdout, _) = run_command(
-            CRYPTSETUP_BIN,
-            &["luksUUID", "--header", header_path, &device.path],
-            None,
-        )
-        .context("read persistent LUKS2 UUID")?;
+        let device_argument = device.cryptsetup_argument();
+        let (stdout, _) = device
+            .run_cryptsetup(
+                &["luksUUID", "--header", header_path, &device_argument],
+                None,
+            )
+            .context("read persistent LUKS2 UUID")?;
         validate_luks_uuid_value(stdout.trim(), expected)
     })
 }
@@ -1444,18 +1484,19 @@ fn validate_persistent_luks_metadata(
     header_path: &str,
 ) -> Result<()> {
     device.run_path_operation(PersistentPathOperation::ReadProfile, || {
-        let (stdout, _) = run_command(
-            CRYPTSETUP_BIN,
-            &[
-                "luksDump",
-                "--dump-json-metadata",
-                "--header",
-                header_path,
-                &device.path,
-            ],
-            None,
-        )
-        .context("read persistent LUKS2 metadata")?;
+        let device_argument = device.cryptsetup_argument();
+        let (stdout, _) = device
+            .run_cryptsetup(
+                &[
+                    "luksDump",
+                    "--dump-json-metadata",
+                    "--header",
+                    header_path,
+                    &device_argument,
+                ],
+                None,
+            )
+            .context("read persistent LUKS2 metadata")?;
         validate_persistent_luks_metadata_json(&stdout)
     })
 }
@@ -1469,7 +1510,7 @@ fn verify_existing_mapper(
 ) -> Result<()> {
     device.run_path_operation(PersistentPathOperation::VerifyKey, || {
         formatter
-            .test_persistent_passphrase(&device.path, header_path, key)
+            .test_persistent_passphrase(device, header_path, key)
             .context("verify key for existing persistent mapper")
     })?;
 
@@ -1665,7 +1706,7 @@ async fn prepare_persistent_mapper(
                     .run_path_operation(PersistentPathOperation::Open, || {
                         formatter
                             .open_persistent_device(
-                                &prepared.device.path,
+                                &prepared.device,
                                 header_path,
                                 &prepared.mapper_name,
                                 &key,
@@ -2049,6 +2090,97 @@ mod tests {
         let _guard = first.clone().lock_owned().await;
         assert!(alias.try_lock().is_err());
         assert!(other.try_lock().is_ok());
+    }
+
+    #[test]
+    fn persistent_cryptsetup_argument_names_only_the_pinned_fd() {
+        let file = tempfile::tempfile().unwrap();
+        let raw_fd = file.as_raw_fd();
+        let device = PinnedPersistentDevice {
+            path: "/dev/host-controlled-name".to_string(),
+            file,
+            identity: BlockDeviceIdentity {
+                number: DeviceNumber::new(8, 1),
+                filesystem_device: 17,
+                inode: 100,
+            },
+        };
+
+        assert_eq!(
+            device.cryptsetup_argument(),
+            format!("/proc/self/fd/{raw_fd}")
+        );
+        assert!(!device.cryptsetup_argument().contains(&device.path));
+    }
+
+    #[test]
+    fn cryptsetup_formats_the_pinned_fd_after_path_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("device");
+        let original_path = directory.path().join("device.original");
+        let pinned = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        pinned.set_len(32 * 1024 * 1024).unwrap();
+
+        std::fs::rename(&path, &original_path).unwrap();
+        let replacement = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        replacement.set_len(32 * 1024 * 1024).unwrap();
+
+        let pinned_argument = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+        run_command_with_inherited_file(
+            CRYPTSETUP_BIN,
+            &[
+                "--batch-mode",
+                "luksFormat",
+                "--type",
+                "luks2",
+                "--pbkdf",
+                "pbkdf2",
+                "--pbkdf-force-iterations",
+                "1000",
+                &pinned_argument,
+                "-",
+            ],
+            Some(TEST_PERSISTENT_KEY),
+            &pinned,
+        )
+        .unwrap();
+
+        let (pinned_uuid, _) = run_command_with_inherited_file(
+            CRYPTSETUP_BIN,
+            &["luksUUID", &pinned_argument],
+            None,
+            &pinned,
+        )
+        .unwrap();
+        run_command_with_inherited_file(
+            CRYPTSETUP_BIN,
+            &[
+                "open",
+                "--test-passphrase",
+                "--key-file",
+                "-",
+                &pinned_argument,
+            ],
+            Some(TEST_PERSISTENT_KEY),
+            &pinned,
+        )
+        .unwrap();
+
+        let original_path = original_path.to_str().unwrap();
+        let replacement_path = path.to_str().unwrap();
+        let (uuid, _) = run_command(CRYPTSETUP_BIN, &["luksUUID", original_path], None).unwrap();
+        assert_eq!(pinned_uuid.trim(), uuid.trim());
+        assert!(run_command(CRYPTSETUP_BIN, &["isLuks", replacement_path], None).is_err());
     }
 
     #[test]
@@ -2650,19 +2782,18 @@ mod tests {
             .unwrap();
         device_file.sync_all().unwrap();
 
-        let source = open_persistent_device(device.dev_path()).unwrap();
+        let source = PinnedPersistentDevice::open(
+            device.dev_path(),
+            block_device_number(device.dev_path()).unwrap(),
+        )
+        .unwrap();
         let auth_key = derive_persistent_auth_key(key, &binding).unwrap();
-        let record = load_persistent_metadata(&source, &auth_key, &binding)
+        let record = load_persistent_metadata(&source.file, &auth_key, &binding)
             .unwrap()
             .unwrap();
-        let header = load_verified_header(&source, &record, &auth_key, &binding).unwrap();
+        let header = load_verified_header(&source.file, &record, &auth_key, &binding).unwrap();
         formatter
-            .open_persistent_device(
-                device.dev_path(),
-                header.path().to_str().unwrap(),
-                &mapper_name,
-                key,
-            )
+            .open_persistent_device(&source, header.path().to_str().unwrap(), &mapper_name, key)
             .unwrap();
 
         let mut mapper = File::open(&mapper_path).unwrap();
@@ -2757,7 +2888,7 @@ mod tests {
                     if !matches!(boundary, PersistentCrashBoundary::AfterHeaderCommit) {
                         formatter
                             .open_persistent_device(
-                                device.dev_path(),
+                                &pinned_device,
                                 header.path().to_str().unwrap(),
                                 &mapper_name,
                                 key,
