@@ -85,6 +85,29 @@ struct Cli {
     /// `--initdata_toml /path/to/initdata.toml`
     #[arg(short = 't', long)]
     initdata_toml: Option<String>,
+
+    /// Refuse to start unless the selected attester binds the supplied Init-Data.
+    ///
+    /// This is intended for confidential profiles whose authorization policy is
+    /// measured through Init-Data. It makes both a missing Init-Data input and an
+    /// attester that returns `Unsupported` fatal.
+    #[arg(long)]
+    require_initdata_binding: bool,
+}
+
+fn validate_initdata_binding(
+    required: bool,
+    result: Option<&attester::InitDataResult>,
+) -> Result<()> {
+    match result {
+        Some(attester::InitDataResult::Ok) => Ok(()),
+        Some(attester::InitDataResult::Unsupported) if required => {
+            bail!("the selected attester does not support required Init-Data binding")
+        }
+        Some(attester::InitDataResult::Unsupported) => Ok(()),
+        None if required => bail!("required Init-Data was not supplied"),
+        None => Ok(()),
+    }
 }
 
 pub fn start_ttrpc_service(aa: AttestationAgent) -> Result<HashMap<String, Service>> {
@@ -156,12 +179,17 @@ rpc: ttrpc
         initdata_digest = Some(initdata);
     }
 
-    if let Some(initdata_digest) = initdata_digest {
-        let res = aa.bind_init_data(&initdata_digest).await.context(
-        "The initdata supplied by the parameter is inconsistent with that of the current platform.",
-    )?;
+    let initdata_result = if let Some(initdata_digest) = initdata_digest {
+        Some(aa.bind_init_data(&initdata_digest).await.context(
+            "The initdata supplied by the parameter is inconsistent with that of the current platform.",
+        )?)
+    } else {
+        None
+    };
 
-        match res {
+    validate_initdata_binding(cli.require_initdata_binding, initdata_result.as_ref())?;
+    if let Some(result) = initdata_result {
+        match result {
             attester::InitDataResult::Ok => info!("Check initdata passed."),
             attester::InitDataResult::Unsupported => {
                 info!("Platform does not support initdata checking. Jumping.")
@@ -209,4 +237,33 @@ fn clean_previous_sock_file(unix_socket: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_initdata_binding_fails_closed() {
+        assert!(validate_initdata_binding(true, None).is_err());
+        assert!(
+            validate_initdata_binding(true, Some(&attester::InitDataResult::Unsupported)).is_err()
+        );
+        assert!(validate_initdata_binding(true, Some(&attester::InitDataResult::Ok)).is_ok());
+    }
+
+    #[test]
+    fn optional_initdata_binding_preserves_existing_behavior() {
+        assert!(validate_initdata_binding(false, None).is_ok());
+        assert!(
+            validate_initdata_binding(false, Some(&attester::InitDataResult::Unsupported)).is_ok()
+        );
+        assert!(validate_initdata_binding(false, Some(&attester::InitDataResult::Ok)).is_ok());
+    }
+
+    #[test]
+    fn cli_accepts_required_initdata_binding_flag() {
+        let cli = Cli::try_parse_from(["ttrpc-aa", "--require-initdata-binding"]).unwrap();
+        assert!(cli.require_initdata_binding);
+    }
 }
