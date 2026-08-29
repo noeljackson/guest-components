@@ -92,6 +92,29 @@ impl GetResourceService for Cdh {
 
         Result::Ok(Response::new(reply))
     }
+
+    async fn get_public_resource(
+        &self,
+        request: Request<GetResourceRequest>,
+    ) -> Result<Response<GetResourceResponse>, Status> {
+        debug!("[gRPC CDH] get new GetPublicResource request");
+        let resource = self
+            .inner
+            .get_public_resource(request.into_inner().resource_path)
+            .await
+            .map_err(|e| match e {
+                confidential_data_hub::Error::PublicResourceDenied => {
+                    Status::permission_denied("public resource access denied")
+                }
+                _ => {
+                    let detailed_error = format_error!(e);
+                    error!("[gRPC CDH] Call CDH to get public resource failed:\n{detailed_error}");
+                    Status::internal(format!("[CDH] [ERROR]: {e}"))
+                }
+            })?;
+
+        Result::Ok(Response::new(GetResourceResponse { resource }))
+    }
 }
 
 #[tonic::async_trait]

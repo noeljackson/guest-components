@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{path::Path, sync::Arc};
+use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -98,18 +98,21 @@ rpc: ttrpc
     create_socket_parent_directory(unix_socket_path).await?;
     clean_previous_sock_file(unix_socket_path).await?;
 
-    let server = Server::new(&config).await.context("create CDH instance")?;
-    let server = Arc::new(server);
+    let service = Server::new(&config).await.context("create CDH instance")?;
+    let service = Arc::new(service);
 
-    let mut server = TtrpcServer::new()
+    let listener = TtrpcServer::new()
         .bind(&config.socket)
-        .context("cannot bind cdh ttrpc service")?
-        .register_service(create_sealed_secret_service(server.clone() as _))
-        .register_service(create_get_resource_service(server.clone() as _))
-        .register_service(create_key_provider_service(server.clone() as _))
-        .register_service(create_secure_mount_service(server.clone() as _))
-        .register_service(create_secure_volume_service(server.clone() as _))
-        .register_service(create_image_pull_service(server.clone() as _));
+        .context("cannot bind cdh ttrpc service")?;
+    set_socket_permissions(unix_socket_path).await?;
+
+    let mut server = listener
+        .register_service(create_sealed_secret_service(service.clone() as _))
+        .register_service(create_get_resource_service(service.clone() as _))
+        .register_service(create_key_provider_service(service.clone() as _))
+        .register_service(create_secure_mount_service(service.clone() as _))
+        .register_service(create_secure_volume_service(service.clone() as _))
+        .register_service(create_image_pull_service(service.clone() as _));
 
     info!(
         "[ttRPC] Confidential Data Hub starts to listen to request: {}",
@@ -147,5 +150,36 @@ async fn create_socket_parent_directory(unix_socket_file: &str) -> Result<()> {
         .parent()
         .ok_or(anyhow!("The file path does not have a parent directory."))?;
     fs::create_dir_all(parent_directory).await?;
+    fs::set_permissions(parent_directory, Permissions::from_mode(0o700)).await?;
     Ok(())
+}
+
+async fn set_socket_permissions(unix_socket_file: &str) -> Result<()> {
+    fs::set_permissions(unix_socket_file, Permissions::from_mode(0o600)).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cdh_socket_paths_are_restricted_to_the_service_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("runtime").join("cdh.sock");
+        let socket = socket.to_str().unwrap();
+
+        create_socket_parent_directory(socket).await.unwrap();
+        fs::write(socket, b"").await.unwrap();
+        set_socket_permissions(socket).await.unwrap();
+
+        let parent_mode = std::fs::metadata(temp.path().join("runtime"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let socket_mode = std::fs::metadata(socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o700);
+        assert_eq!(socket_mode, 0o600);
+    }
 }

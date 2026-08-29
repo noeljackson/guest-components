@@ -118,6 +118,12 @@ pub struct CdhConfig {
     #[serde(default = "default_socket_addr")]
     pub socket: String,
 
+    /// Canonical local KBS URI prefixes that must never be returned through
+    /// the workload-facing public resource API. Internal Agent operations,
+    /// including secure-volume activation, do not use that API.
+    #[serde(default)]
+    pub protected_resource_uri_prefixes: Vec<String>,
+
     /// Sealed Secrets use JWS integrity protection to ensure
     /// that the secret cannot be modified while it is stored
     /// by the untrusted control plane.
@@ -139,6 +145,7 @@ impl CdhConfig {
             aa: AaConfig::default(),
             credentials: Vec::new(),
             socket: default_socket_addr(),
+            protected_resource_uri_prefixes: Vec::new(),
             image: ImageConfig::from_kernel_cmdline(),
             skip_sealed_secret_verification: false,
             log: LogConfig::default(),
@@ -253,6 +260,7 @@ mod tests {
     #[case(
         r#"
 socket = "unix:///run/confidential-containers/cdh.sock"
+protected_resource_uri_prefixes = ["kbs:///default/volume-keys/"]
 
 [aa]
 aa_socket = "unix:///run/confidential-containers/attestation-agent/attestation-agent.sock"
@@ -324,6 +332,9 @@ https_proxy = "http://127.0.0.1:8080"
                 ..Default::default()
             },
             socket: "unix:///run/confidential-containers/cdh.sock".to_string(),
+            protected_resource_uri_prefixes: vec![
+                "kbs:///default/volume-keys/".to_string(),
+            ],
             skip_sealed_secret_verification: false,
         })
     )]
@@ -362,6 +373,7 @@ name = "offline_fs_kbc"
                 ..Default::default()
         },
         socket: DEFAULT_CDH_SOCKET_ADDR.to_string(),
+        protected_resource_uri_prefixes: vec![],
         skip_sealed_secret_verification: false,
     })
     )]
@@ -397,6 +409,7 @@ some_undefined_field = "unknown value"
                 ..Default::default()
         },
         socket: DEFAULT_CDH_SOCKET_ADDR.to_string(),
+        protected_resource_uri_prefixes: vec![],
         skip_sealed_secret_verification: false,
     })
     )]
@@ -432,6 +445,7 @@ image_security_policy = """
                 ..Default::default()
         },
         socket: DEFAULT_CDH_SOCKET_ADDR.to_string(),
+        protected_resource_uri_prefixes: vec![],
         skip_sealed_secret_verification: false,
         aa: AaConfig::default(),
     })
