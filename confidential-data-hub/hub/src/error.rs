@@ -22,6 +22,9 @@ pub enum Error {
         source: kms::Error,
     },
 
+    #[error("Public resource access denied")]
+    PublicResourceDenied,
+
     #[error("Decrypt Image (UnwrapKey) failed")]
     ImageDecryption(#[from] image::Error),
 
@@ -92,6 +95,7 @@ mod tests {
     #[rstest]
     #[case(Error::KbsClient { source: kms::Error::KbsClientError("details".into()) }, "kbs client initialization failed")]
     #[case(Error::GetResource { source: kms::Error::KbsClientError("details".into()) }, "Get Resource failed: Kbs client error: details")]
+    #[case(Error::PublicResourceDenied, "Public resource access denied")]
     #[case(
         Error::UnsealSecret(secret::SecretError::VersionError),
         "Unseal Secret failed"

@@ -29,6 +29,10 @@ pub trait DataHub {
     /// <https://github.com/confidential-containers/guest-components/blob/main/attestation-agent/docs/KBS_URI.md>
     async fn get_resource(&self, uri: String) -> Result<Vec<u8>>;
 
+    /// Get a resource for a workload-facing API after applying the configured
+    /// protected-namespace policy.
+    async fn get_public_resource(&self, uri: String) -> Result<Vec<u8>>;
+
     async fn secure_mount(&self, storage: Storage) -> Result<String>;
 
     /// Activate a manifest-driven secure block volume.

@@ -78,6 +78,7 @@ service SealedSecretService {
 
 service GetResourceService {
     rpc GetResource(GetResourceRequest) returns (GetResourceResponse) {};
+    rpc GetPublicResource(GetResourceRequest) returns (GetResourceResponse) {};
 }
 
 service SecureMountService {
