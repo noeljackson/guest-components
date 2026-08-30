@@ -53,11 +53,23 @@ struct Cli {
     /// `--config /etc/confidential-data-hub.conf`
     #[arg(short)]
     config: Option<String>,
+
+    /// Verify the compiled secure-volume manifest and crypto profile, then exit
+    #[arg(long)]
+    verify_secure_volume_contract: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.verify_secure_volume_contract {
+        let (schema, profile) =
+            confidential_data_hub::storage::secure_volume::verify_packaged_contract()
+                .context("secure-volume contract verification failed")?;
+        println!("secure-volume-contract schema={schema} profile={profile} status=pass");
+        return Ok(());
+    }
 
     let (config, config_log) = config::read_config(cli.config).context("failed to read config")?;
 

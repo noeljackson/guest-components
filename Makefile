@@ -59,6 +59,9 @@ CDH_BINARY := $(BUILD_DIR)/$(CDH)
 AA_BINARY := $(BUILD_DIR)/$(AA)
 ASR_BINARY := $(BUILD_DIR)/$(ASR)
 
+.PHONY: build install install-prebuilt clean fmt lint test test-persistent-storage \
+	$(CDH_BINARY) $(AA_BINARY) $(ASR_BINARY)
+
 build: $(CDH_BINARY) $(ASR_BINARY) $(AA_BINARY)
 	@echo guest components built for $(TEE_PLATFORM) succeeded!
 
@@ -75,6 +78,8 @@ $(ASR_BINARY):
 	cd $(ASR) && $(MAKE) ARCH=$(ARCH) LIBC=$(LIBC)
 
 install: $(CDH_BINARY) $(ASR_BINARY) $(AA_BINARY)
+
+install install-prebuilt:
 	install -D -m0755 $(CDH_BINARY) $(DESTDIR)/$(CDH)
 	install -D -m0755 $(AA_BINARY) $(DESTDIR)/$(AA)
 	install -D -m0755 $(ASR_BINARY) $(DESTDIR)/$(ASR)
