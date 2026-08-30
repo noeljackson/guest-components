@@ -53,17 +53,26 @@ const HMAC_SHA256: &str = "hmac-sha256";
 const HMAC_SHA256_STATUS: &str = "hmac(sha256)";
 
 const SECTOR_SIZE: u32 = 4096;
-const PERSISTENT_LUKS_KEY_BITS: &str = "512";
-const PERSISTENT_LUKS_KEY_BYTES: u64 = 64;
+const PERSISTENT_DATA_KEY_BITS: u64 = 512;
+const PERSISTENT_DATA_KEY_BYTES: u64 = 64;
+const PERSISTENT_INTEGRITY_KEY_BITS: u64 = 256;
+const PERSISTENT_INTEGRITY_KEY_BYTES: u64 = 32;
+// LUKS2 records the combined dm-crypt and dm-integrity volume key in its
+// keyslot metadata. HMAC-SHA256 therefore adds its 256-bit integrity key to
+// the 512-bit AES-XTS data key.
+const PERSISTENT_VOLUME_KEY_BYTES: u64 = PERSISTENT_DATA_KEY_BYTES + PERSISTENT_INTEGRITY_KEY_BYTES;
 const PERSISTENT_PBKDF: &str = "pbkdf2";
 const PERSISTENT_PBKDF_HASH: &str = "sha256";
-const PERSISTENT_PBKDF_ITERATIONS: &str = "100000";
+const PERSISTENT_PBKDF_ITERATIONS: u64 = 100_000;
 const PERSISTENT_KEYFILE_BYTES: &str = "32";
 const PERSISTENT_DIGEST_ITERATIONS: u64 = 1000;
 const PERSISTENT_AF_STRIPES: u64 = 4000;
 const PERSISTENT_JSON_AREA_BYTES: u64 = PERSISTENT_LUKS2_METADATA_AREA_BYTES - 4096;
 const PERSISTENT_KEYSLOT_AREA_OFFSET_BYTES: &str = "32768";
-const PERSISTENT_KEYSLOT_AREA_BYTES: &str = "258048";
+const PERSISTENT_KEYSLOT_AREA_ALIGNMENT_BYTES: u64 = 4096;
+const PERSISTENT_KEYSLOT_AREA_BYTES: u64 = (PERSISTENT_VOLUME_KEY_BYTES * PERSISTENT_AF_STRIPES)
+    .div_ceil(PERSISTENT_KEYSLOT_AREA_ALIGNMENT_BYTES)
+    * PERSISTENT_KEYSLOT_AREA_ALIGNMENT_BYTES;
 
 const CRYPTSETUP_BIN: &str = "cryptsetup";
 const BLKID_BIN: &str = "blkid";
@@ -817,7 +826,7 @@ fn luks_format_arguments(
     if integrity_initialization == IntegrityInitialization::CompleteWithJournal {
         args.extend([
             "--key-size".to_string(),
-            PERSISTENT_LUKS_KEY_BITS.to_string(),
+            PERSISTENT_DATA_KEY_BITS.to_string(),
             "--keyfile-size".to_string(),
             PERSISTENT_KEYFILE_BYTES.to_string(),
             "--pbkdf".to_string(),
@@ -846,7 +855,12 @@ fn luks_format_arguments(
         args.extend(["--uuid".to_string(), luks_uuid.to_string()]);
     }
     if integrity {
-        args.extend(["--integrity".to_string(), HMAC_SHA256.to_string()]);
+        args.extend([
+            "--integrity".to_string(),
+            HMAC_SHA256.to_string(),
+            "--integrity-key-size".to_string(),
+            PERSISTENT_INTEGRITY_KEY_BITS.to_string(),
+        ]);
         if integrity_initialization == IntegrityInitialization::SkipWipeWithoutJournal {
             args.extend([
                 "--integrity-no-wipe".to_string(),
@@ -1386,6 +1400,7 @@ struct PersistentLuksSegment {
 struct PersistentLuksIntegrity {
     #[serde(rename = "type")]
     integrity_type: String,
+    key_size: u64,
     journal_encryption: String,
     journal_integrity: String,
 }
@@ -1410,6 +1425,19 @@ struct PersistentLuksConfig {
     keyslots_size: String,
 }
 
+fn require_profile_field<T>(field: &str, actual: T, expected: T) -> Result<()>
+where
+    T: std::fmt::Debug + PartialEq,
+{
+    if actual != expected {
+        bail!(
+            "persistent LUKS2 metadata field {field} mismatch: expected {expected:?}, got {actual:?}"
+        )
+    }
+
+    Ok(())
+}
+
 fn validate_persistent_luks_metadata_json(json: &str) -> Result<()> {
     let metadata: PersistentLuksMetadata =
         serde_json::from_str(json).context("parse persistent LUKS2 JSON metadata")?;
@@ -1418,64 +1446,152 @@ fn validate_persistent_luks_metadata_json(json: &str) -> Result<()> {
         || metadata.segments.len() != 1
         || metadata.digests.len() != 1
     {
-        bail!("persistent LUKS2 metadata has an unexpected object count")
+        bail!(
+            "persistent LUKS2 metadata has an unexpected object count: tokens={}, keyslots={}, segments={}, digests={}",
+            metadata.tokens.len(),
+            metadata.keyslots.len(),
+            metadata.segments.len(),
+            metadata.digests.len()
+        )
     }
 
     let keyslot = metadata
         .keyslots
         .get("0")
         .context("persistent LUKS2 metadata is missing keyslot 0")?;
-    if keyslot.slot_type != "luks2"
-        || keyslot.key_size != PERSISTENT_LUKS_KEY_BYTES
-        || keyslot.af.af_type != "luks1"
-        || keyslot.af.stripes != PERSISTENT_AF_STRIPES
-        || keyslot.af.hash != PERSISTENT_PBKDF_HASH
-        || keyslot.area.area_type != "raw"
-        || keyslot.area.offset != PERSISTENT_KEYSLOT_AREA_OFFSET_BYTES
-        || keyslot.area.size != PERSISTENT_KEYSLOT_AREA_BYTES
-        || keyslot.area.encryption != "aes-xts-plain64"
-        || keyslot.area.key_size != PERSISTENT_LUKS_KEY_BYTES
-        || keyslot.kdf.kdf_type != PERSISTENT_PBKDF
-        || keyslot.kdf.hash != PERSISTENT_PBKDF_HASH
-        || keyslot.kdf.iterations.to_string() != PERSISTENT_PBKDF_ITERATIONS
-        || keyslot.kdf.salt.is_empty()
-    {
-        bail!("persistent LUKS2 keyslot does not match crypto profile")
+    require_profile_field("keyslot.type", keyslot.slot_type.as_str(), "luks2")?;
+    require_profile_field(
+        "keyslot.key_size",
+        keyslot.key_size,
+        PERSISTENT_VOLUME_KEY_BYTES,
+    )?;
+    require_profile_field("keyslot.af.type", keyslot.af.af_type.as_str(), "luks1")?;
+    require_profile_field(
+        "keyslot.af.stripes",
+        keyslot.af.stripes,
+        PERSISTENT_AF_STRIPES,
+    )?;
+    require_profile_field(
+        "keyslot.af.hash",
+        keyslot.af.hash.as_str(),
+        PERSISTENT_PBKDF_HASH,
+    )?;
+    require_profile_field("keyslot.area.type", keyslot.area.area_type.as_str(), "raw")?;
+    require_profile_field(
+        "keyslot.area.offset",
+        keyslot.area.offset.as_str(),
+        PERSISTENT_KEYSLOT_AREA_OFFSET_BYTES,
+    )?;
+    let expected_keyslot_area_size = PERSISTENT_KEYSLOT_AREA_BYTES.to_string();
+    require_profile_field(
+        "keyslot.area.size",
+        keyslot.area.size.as_str(),
+        expected_keyslot_area_size.as_str(),
+    )?;
+    require_profile_field(
+        "keyslot.area.encryption",
+        keyslot.area.encryption.as_str(),
+        "aes-xts-plain64",
+    )?;
+    require_profile_field(
+        "keyslot.area.key_size",
+        keyslot.area.key_size,
+        PERSISTENT_DATA_KEY_BYTES,
+    )?;
+    require_profile_field(
+        "keyslot.kdf.type",
+        keyslot.kdf.kdf_type.as_str(),
+        PERSISTENT_PBKDF,
+    )?;
+    require_profile_field(
+        "keyslot.kdf.hash",
+        keyslot.kdf.hash.as_str(),
+        PERSISTENT_PBKDF_HASH,
+    )?;
+    require_profile_field(
+        "keyslot.kdf.iterations",
+        keyslot.kdf.iterations,
+        PERSISTENT_PBKDF_ITERATIONS,
+    )?;
+    if keyslot.kdf.salt.is_empty() {
+        bail!("persistent LUKS2 metadata field keyslot.kdf.salt is empty")
     }
 
     let segment = metadata
         .segments
         .get("0")
         .context("persistent LUKS2 metadata is missing segment 0")?;
-    if segment.segment_type != "crypt"
-        || segment.offset != PERSISTENT_DATA_OFFSET_BYTES.to_string()
-        || segment.size != "dynamic"
-        || segment.iv_tweak != "0"
-        || segment.encryption != "aes-xts-plain64"
-        || segment.sector_size != SECTOR_SIZE
-        || segment.integrity.integrity_type != HMAC_SHA256_STATUS
-        || segment.integrity.journal_encryption != "none"
-        || segment.integrity.journal_integrity != "none"
-    {
-        bail!("persistent LUKS2 segment does not match crypto profile")
-    }
+    require_profile_field("segment.type", segment.segment_type.as_str(), "crypt")?;
+    let expected_data_offset = PERSISTENT_DATA_OFFSET_BYTES.to_string();
+    require_profile_field(
+        "segment.offset",
+        segment.offset.as_str(),
+        expected_data_offset.as_str(),
+    )?;
+    require_profile_field("segment.size", segment.size.as_str(), "dynamic")?;
+    require_profile_field("segment.iv_tweak", segment.iv_tweak.as_str(), "0")?;
+    require_profile_field(
+        "segment.encryption",
+        segment.encryption.as_str(),
+        "aes-xts-plain64",
+    )?;
+    require_profile_field("segment.sector_size", segment.sector_size, SECTOR_SIZE)?;
+    require_profile_field(
+        "segment.integrity.type",
+        segment.integrity.integrity_type.as_str(),
+        HMAC_SHA256_STATUS,
+    )?;
+    require_profile_field(
+        "segment.integrity.key_size",
+        segment.integrity.key_size,
+        PERSISTENT_INTEGRITY_KEY_BYTES,
+    )?;
+    require_profile_field(
+        "segment.integrity.journal_encryption",
+        segment.integrity.journal_encryption.as_str(),
+        "none",
+    )?;
+    require_profile_field(
+        "segment.integrity.journal_integrity",
+        segment.integrity.journal_integrity.as_str(),
+        "none",
+    )?;
 
     let digest = metadata
         .digests
         .get("0")
         .context("persistent LUKS2 metadata is missing digest 0")?;
-    if digest.digest_type != "pbkdf2"
-        || digest.keyslots != ["0"]
-        || digest.segments != ["0"]
-        || digest.hash != PERSISTENT_PBKDF_HASH
-        || digest.iterations != PERSISTENT_DIGEST_ITERATIONS
-        || digest.salt.is_empty()
-        || digest.digest.is_empty()
-        || metadata.config.json_size != PERSISTENT_JSON_AREA_BYTES.to_string()
-        || metadata.config.keyslots_size != PERSISTENT_LUKS2_KEYSLOTS_AREA_BYTES.to_string()
-    {
-        bail!("persistent LUKS2 digest or layout does not match crypto profile")
+    require_profile_field("digest.type", digest.digest_type.as_str(), "pbkdf2")?;
+    if digest.keyslots != ["0"] {
+        bail!("persistent LUKS2 metadata field digest.keyslots mismatch")
     }
+    if digest.segments != ["0"] {
+        bail!("persistent LUKS2 metadata field digest.segments mismatch")
+    }
+    require_profile_field("digest.hash", digest.hash.as_str(), PERSISTENT_PBKDF_HASH)?;
+    require_profile_field(
+        "digest.iterations",
+        digest.iterations,
+        PERSISTENT_DIGEST_ITERATIONS,
+    )?;
+    if digest.salt.is_empty() {
+        bail!("persistent LUKS2 metadata field digest.salt is empty")
+    }
+    if digest.digest.is_empty() {
+        bail!("persistent LUKS2 metadata field digest.digest is empty")
+    }
+    let expected_json_size = PERSISTENT_JSON_AREA_BYTES.to_string();
+    require_profile_field(
+        "config.json_size",
+        metadata.config.json_size.as_str(),
+        expected_json_size.as_str(),
+    )?;
+    let expected_keyslots_size = PERSISTENT_LUKS2_KEYSLOTS_AREA_BYTES.to_string();
+    require_profile_field(
+        "config.keyslots_size",
+        metadata.config.keyslots_size.as_str(),
+        expected_keyslots_size.as_str(),
+    )?;
     Ok(())
 }
 
@@ -2028,6 +2144,8 @@ mod tests {
                 "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "--integrity",
                 "hmac-sha256",
+                "--integrity-key-size",
+                "256",
                 "/dev/vdb",
                 "-",
             ]
@@ -2044,14 +2162,14 @@ mod tests {
 
     fn persistent_luks_metadata_fixture() -> &'static str {
         r#"{
-          "keyslots":{"0":{"type":"luks2","key_size":64,
+          "keyslots":{"0":{"type":"luks2","key_size":96,
             "af":{"type":"luks1","stripes":4000,"hash":"sha256"},
-            "area":{"type":"raw","offset":"32768","size":"258048","encryption":"aes-xts-plain64","key_size":64},
+            "area":{"type":"raw","offset":"32768","size":"385024","encryption":"aes-xts-plain64","key_size":64},
             "kdf":{"type":"pbkdf2","hash":"sha256","iterations":100000,"salt":"salt"}}},
           "tokens":{},
           "segments":{"0":{"type":"crypt","offset":"16785408","size":"dynamic","iv_tweak":"0",
             "encryption":"aes-xts-plain64","sector_size":4096,
-            "integrity":{"type":"hmac(sha256)","journal_encryption":"none","journal_integrity":"none"}}},
+            "integrity":{"type":"hmac(sha256)","key_size":32,"journal_encryption":"none","journal_integrity":"none"}}},
           "digests":{"0":{"type":"pbkdf2","keyslots":["0"],"segments":["0"],"hash":"sha256",
             "iterations":1000,"salt":"salt","digest":"digest"}},
           "config":{"json_size":"12288","keyslots_size":"16744448"}
@@ -2063,14 +2181,34 @@ mod tests {
         let valid = persistent_luks_metadata_fixture();
         validate_persistent_luks_metadata_json(valid).unwrap();
 
-        for invalid in [
-            valid.replace("\"iterations\":100000", "\"iterations\":99999"),
-            valid.replace("\"key_size\":64", "\"key_size\":32"),
-            valid.replace("hmac(sha256)", "crc32c"),
-            valid.replace("\"sector_size\":4096", "\"sector_size\":512"),
-            valid.replace("\"tokens\":{}", "\"tokens\":{\"0\":{}}"),
+        for (invalid, expected_error) in [
+            (
+                valid.replace("\"iterations\":100000", "\"iterations\":99999"),
+                "keyslot.kdf.iterations",
+            ),
+            (
+                valid.replacen("\"key_size\":96", "\"key_size\":32", 1),
+                "keyslot.key_size",
+            ),
+            (
+                valid.replace("\"size\":\"385024\"", "\"size\":\"258048\""),
+                "keyslot.area.size",
+            ),
+            (valid.replace("hmac(sha256)", "crc32c"), "segment"),
+            (
+                valid.replace("\"sector_size\":4096", "\"sector_size\":512"),
+                "segment",
+            ),
+            (
+                valid.replace("\"tokens\":{}", "\"tokens\":{\"0\":{}}"),
+                "unexpected object count",
+            ),
         ] {
-            assert!(validate_persistent_luks_metadata_json(&invalid).is_err());
+            let error = validate_persistent_luks_metadata_json(&invalid).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected_error),
+                "unexpected error: {error:#}"
+            );
         }
     }
 
@@ -2914,6 +3052,24 @@ mod tests {
                         std::fs::write(mount_directory.path().join("sentinel"), b"preserve me")
                             .unwrap();
                         expect_sentinel = true;
+
+                        // The Agent owns the final container-scoped mount. CDH
+                        // must not hand an already-mounted mapper to another
+                        // activation after an Agent crash. Recovery becomes
+                        // safe only after the caller cleans up that stale
+                        // mount and mapper.
+                        let error = activate_test_volume(device.dev_path(), key, binding.clone())
+                            .await
+                            .unwrap_err();
+                        assert!(
+                            format!("{error:#}").contains("persistent mapper is already mounted")
+                        );
+                        assert_eq!(
+                            persistent_state(device.dev_path(), key, &binding),
+                            PersistentLuksState::Initializing
+                        );
+                        nix::mount::umount(mount_point).unwrap();
+                        formatter.close_device(&mapper_name).unwrap();
                     } else if matches!(boundary, PersistentCrashBoundary::AfterFilesystemFormat) {
                         formatter.close_device(&mapper_name).unwrap();
                     }
