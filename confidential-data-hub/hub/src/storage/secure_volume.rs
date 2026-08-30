@@ -269,6 +269,39 @@ fn sha256_hex(value: &[u8]) -> String {
         .collect()
 }
 
+/// Exercise the exact manifest and crypto-profile contract compiled into CDH.
+///
+/// Artifact builders call this through the CDH binary after packaging. That
+/// catches a stale executable even when its surrounding image carries a newer
+/// source tag.
+pub fn verify_packaged_contract() -> Result<(u32, u32)> {
+    const KEY: &[u8; PERSISTENT_KEY_BYTES] = b"0123456789abcdef0123456789abcdef";
+
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": SUPPORTED_SCHEMA_VERSION,
+        "volumeId": "00000000-0000-4000-8000-000000000001",
+        "volumeVersion": "00000000-0000-4000-8000-000000000001-v3",
+        "deviceSizeBytes": 1_073_741_824_u64,
+        "access": "readWrite",
+        "protection": {
+            "type": SUPPORTED_PROTECTION_TYPE,
+            "profileVersion": PERSISTENT_PROFILE_VERSION,
+            "keyUri": "kbs:///default/storage-keys/00000000-0000-4000-8000-000000000001",
+            "keySha256": sha256_hex(KEY),
+            "luksUuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        }
+    }))?;
+    let uri = format!(
+        "kbs:///default/storage-manifests/{SHA256_TAG_PREFIX}{}",
+        sha256_hex(&bytes)
+    );
+    let manifest = Manifest::parse_bound(&bytes, &uri)?;
+    manifest.verify_key(KEY)?;
+    manifest.ensure_access(VolumeAccess::ReadWrite)?;
+
+    Ok((SUPPORTED_SCHEMA_VERSION, PERSISTENT_PROFILE_VERSION))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Activation {
     pub activation_id: String,
@@ -504,6 +537,11 @@ mod tests {
         manifest.verify_key(KEY).unwrap();
         manifest.persistent_binding().unwrap();
         manifest.ensure_access(VolumeAccess::ReadWrite).unwrap();
+    }
+
+    #[test]
+    fn packaged_contract_oracle_covers_schema_and_profile() {
+        assert_eq!(verify_packaged_contract().unwrap(), (3, 1));
     }
 
     #[test]

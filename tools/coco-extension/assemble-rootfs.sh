@@ -78,10 +78,15 @@ build_dir="${repo_root_dir}/target/${rust_arch}-unknown-linux-${LIBC}/release"
 build_guest_components() {
 	info "Building guest components (ARCH=${ARCH} LIBC=${LIBC} ATTESTER=${ATTESTER})"
 
-	# The NVIDIA variant is built into this same Cargo output path later.  A
-	# repeated assembly must not let that existing feature-expanded binary
-	# satisfy the stock Make target.
-	rm -f "${build_dir}/attestation-agent"
+	# The top-level Make targets historically treated an existing executable as
+	# complete without any source prerequisites. Never let a retained target
+	# directory publish stale binaries under a new source tag. The Makefile also
+	# dispatches these targets unconditionally; removing the outputs here keeps
+	# the artifact boundary independently fail-closed.
+	rm -f \
+		"${build_dir}/confidential-data-hub" \
+		"${build_dir}/attestation-agent" \
+		"${build_dir}/api-server-rest"
 
 	make -C "${repo_root_dir}" build \
 		TEE_PLATFORM="${TEE_PLATFORM}" \
@@ -214,11 +219,22 @@ install_cryptsetup() {
 install_guest_components() {
 	info "Installing guest components into ${ROOTFS_DIR}"
 
-	make -C "${repo_root_dir}" install \
+	# build_guest_components already produced and stripped these exact outputs.
+	# Installing them directly avoids a second forced Cargo build.
+	make -C "${repo_root_dir}" install-prebuilt \
 		TEE_PLATFORM="${TEE_PLATFORM}" \
 		ARCH="${ARCH}" \
 		LIBC="${LIBC}" \
 		DESTDIR="${ROOTFS_DIR}/usr/local/bin"
+
+	local contract
+	contract="$("${ROOTFS_DIR}/usr/local/bin/confidential-data-hub" \
+		--verify-secure-volume-contract)"
+	[[ "${contract}" == \
+		"secure-volume-contract schema=3 profile=1 status=pass" ]] || \
+		die "packaged CDH does not implement the expected secure-volume contract"
+	info "Verified packaged CDH secure-volume contract"
+
 	verify_attestation_agent_variant \
 		"${ROOTFS_DIR}/usr/local/bin/attestation-agent" stock
 
