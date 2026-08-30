@@ -183,6 +183,9 @@ jobs:
           docker push "${builder}"
         fi
 
+    - name: Verify current-source build dispatch
+      run: ./tools/coco-extension/test-build-source-freshness.sh
+
     - name: Assemble extension rootfs
       run: |
         docker run --rm \
