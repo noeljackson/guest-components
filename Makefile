@@ -114,5 +114,11 @@ test:
 	$(MAKE) -C image-rs test
 	$(MAKE) -C ocicrypt-rs test
 
+# Fast, exact local oracle for the guest-only encrypted persistent-volume
+# lifecycle. The script compiles once, rejects missing/skipped tests, and uses
+# root only for loop, dm-crypt, dm-integrity, filesystem, and mount operations.
+test-persistent-storage:
+	./tools/test-persistent-storage
+
 clean:
 	rm -rf target
