@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+readonly REPO_ROOT
+cd -- "${REPO_ROOT}"
+
+for required_command in cargo cryptsetup losetup mkfs.ext4 mount umount; do
+	if ! command -v "${required_command}" >/dev/null 2>&1; then
+		echo "error: persistent-storage test requires ${required_command}" >&2
+		exit 2
+	fi
+done
+
+if [[ "$(id -u)" -eq 0 ]]; then
+	run_as_root=(env "RUST_LOG=${RUST_LOG:-warn}")
+else
+	if ! command -v sudo >/dev/null 2>&1 || ! sudo -n true; then
+		echo "error: persistent-storage test requires root or passwordless sudo" >&2
+		exit 2
+	fi
+	run_as_root=(sudo -n env "RUST_LOG=${RUST_LOG:-warn}")
+fi
+
+cargo test -p confidential-data-hub --lib --no-run
+
+test_binary="$({
+	find target/debug/deps -maxdepth 1 -type f -name 'confidential_data_hub-*' -perm -u+x \
+		-printf '%T@ %p\n'
+} | sort -nr | head -n 1 | cut -d' ' -f2-)"
+if [[ -z "${test_binary}" || ! -x "${test_binary}" ]]; then
+	echo "error: compiled confidential-data-hub test binary was not found" >&2
+	exit 2
+fi
+
+readonly unit_test='storage::drivers::luks2::tests::effective_luks_metadata_must_match_the_complete_profile'
+readonly -a root_tests=(
+	'storage::drivers::luks2::tests::persistent_luks2_loop_lifecycle_and_init_recovery'
+	'storage::drivers::luks2::tests::persistent_luks2_rejects_a_modified_header_before_opening_it'
+	'storage::drivers::luks2::tests::persistent_luks2_detects_corrupted_payload'
+	'storage::drivers::luks2::tests::persistent_luks2_recovers_across_initialization_phase_boundaries'
+	'storage::drivers::luks2::tests::interrupted_persistent_integrity_format_fails_without_mutation'
+)
+
+listed_tests="$("${test_binary}" --list)"
+if ! grep -Fqx "${unit_test}: test" <<<"${listed_tests}"; then
+	echo "error: required persistent-storage unit test is missing: ${unit_test}" >&2
+	exit 2
+fi
+
+listed_ignored_tests="$("${test_binary}" --list --ignored)"
+for test_name in "${root_tests[@]}"; do
+	if ! grep -Fqx "${test_name}: test" <<<"${listed_ignored_tests}"; then
+		echo "error: required persistent-storage root test is missing or no longer ignored: ${test_name}" >&2
+		exit 2
+	fi
+done
+
+"${test_binary}" "${unit_test}" --exact
+for test_name in "${root_tests[@]}"; do
+	echo "running persistent-storage root test: ${test_name}"
+	"${run_as_root[@]}" "${test_binary}" "${test_name}" \
+		--exact --ignored --nocapture --test-threads=1
+done
+
+echo "persistent-storage lifecycle tests passed"
