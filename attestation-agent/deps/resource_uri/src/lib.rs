@@ -51,6 +51,16 @@ impl TryFrom<url::Url> for ResourceUri {
     type Error = &'static str;
 
     fn try_from(value: url::Url) -> Result<Self, Self::Error> {
+        // Actix and other HTTP routers percent-decode captured path parameters
+        // before handing them to a resource lookup. Retaining escapes here
+        // would therefore let two textual URIs name the same KBS resource while
+        // policy compares different strings. KBS resource path identifiers are
+        // canonical ASCII; reject aliases instead of attempting to normalize
+        // them independently from every possible server implementation.
+        if value.path().as_bytes().contains(&b'%') {
+            return Err("percent-encoded kbs resource path segments are not supported");
+        }
+
         let mut kbs_address = value.host_str().unwrap_or_default().to_string();
 
         if !kbs_address.is_empty()
@@ -129,6 +139,10 @@ impl ResourceUri {
         plugin: Option<&str>,
         query: Option<&str>,
     ) -> Result<Self> {
+        if resource_path.as_bytes().contains(&b'%') {
+            bail!("percent-encoded kbs resource path segments are not supported")
+        }
+
         let kbs_address = match url::Url::parse(kbs_uri) {
             Ok(url) => {
                 let kbs_host = url
@@ -311,9 +325,28 @@ mod tests {
     #[rstest]
     #[case("http:///repo/type/tag", "scheme must be kbs")]
     #[case("kbs+:///repo/type/tag", "requires a plugin name")]
-    fn test_invalid_scheme(#[case] uri: &str, #[case] error: &str) {
+    #[case(
+        "kbs:///repo/%74ype/tag",
+        "percent-encoded kbs resource path segments are not supported"
+    )]
+    #[case(
+        "kbs:///repo/type/%2Ftag",
+        "percent-encoded kbs resource path segments are not supported"
+    )]
+    fn test_invalid_resource_uri(#[case] uri: &str, #[case] error: &str) {
         let result = ResourceUri::try_from(uri);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains(error));
+    }
+
+    #[test]
+    fn constructor_rejects_percent_encoded_path_aliases() {
+        let result = ResourceUri::new("", "/repo/%74ype/tag", None, None);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("percent-encoded kbs resource path segments are not supported")
+        );
     }
 }

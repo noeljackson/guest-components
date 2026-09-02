@@ -62,8 +62,18 @@ impl ProtectedResourcePrefixes {
     }
 
     fn allows(&self, uri: &str) -> bool {
+        self.canonical_resource(uri)
+            .is_some_and(|resource| !self.protects_resource(&resource))
+    }
+
+    fn protects(&self, uri: &str) -> bool {
+        self.canonical_resource(uri)
+            .is_some_and(|resource| self.protects_resource(&resource))
+    }
+
+    fn canonical_resource(&self, uri: &str) -> Option<ResourceUri> {
         let Ok(resource) = ResourceUri::try_from(uri) else {
-            return false;
+            return None;
         };
         if resource.plugin() != DEFAULT_RESOURCE_PLUGIN
             || !resource.kbs_address.is_empty()
@@ -71,11 +81,14 @@ impl ProtectedResourcePrefixes {
             || resource.whole_uri() != uri
             || resource.path.iter().any(String::is_empty)
         {
-            return false;
+            return None;
         }
 
-        !self
-            .0
+        Some(resource)
+    }
+
+    fn protects_resource(&self, resource: &ResourceUri) -> bool {
+        self.0
             .iter()
             .any(|prefix| resource.path.starts_with(prefix))
     }
@@ -228,14 +241,25 @@ impl DataHub for Hub {
             .map_err(|error| secure_volume_resource_error("manifest_fetch", error))?;
         let manifest = Manifest::parse_bound(&manifest_bytes, manifest_uri)?;
         manifest.ensure_access(requested_access)?;
+        if !self
+            .protected_resource_prefixes
+            .protects(&manifest.protection.key_uri)
+        {
+            return Err(crate::storage::secure_volume::Error::InvalidManifest(
+                "secure-volume key URI must belong to a configured protected resource namespace"
+                    .to_string(),
+            )
+            .into());
+        }
         let key = self
             .resource_client
             .get(&manifest.protection.key_uri)
             .await
+            .map(Zeroizing::new)
             .map_err(|error| secure_volume_resource_error("key_fetch", error))?;
         manifest.verify_key(&key)?;
         self.secure_volumes
-            .activate(device_id, &manifest, requested_access, Zeroizing::new(key))
+            .activate(device_id, &manifest, requested_access, key)
             .await
             .map_err(Into::into)
     }
@@ -363,9 +387,17 @@ mod tests {
 
     use super::*;
     use crate::{AaConfig, KbsConfig, LogConfig};
+    use sha2::{Digest, Sha256};
+
+    const VOLUME_KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 
     struct StatefulGetter {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct SequenceGetter {
+        calls: Arc<AtomicUsize>,
+        resources: Vec<Vec<u8>>,
     }
 
     #[async_trait]
@@ -378,6 +410,78 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             Ok(call.to_string().into_bytes())
         }
+    }
+
+    #[async_trait]
+    impl kms::Getter for SequenceGetter {
+        async fn get_secret(
+            &self,
+            _name: &str,
+            _annotations: &Annotations,
+        ) -> kms::Result<Vec<u8>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.resources
+                .get(call)
+                .cloned()
+                .ok_or_else(|| kms::Error::KbsClientError("unexpected resource fetch".into()))
+        }
+    }
+
+    fn test_hub(client: Box<dyn kms::Getter>, prefixes: Vec<String>) -> Hub {
+        Hub {
+            credentials: HashMap::new(),
+            image_client: OnceCell::const_new(),
+            resource_client: ResourceClient::with_client(client),
+            protected_resource_prefixes: ProtectedResourcePrefixes::from_config(&prefixes).unwrap(),
+            #[cfg(feature = "ttrpc")]
+            aa_client: OnceCell::const_new(),
+            config: CdhConfig {
+                kbc: KbsConfig {
+                    name: "offline_fs_kbc".to_string(),
+                    url: String::new(),
+                    kbs_cert: None,
+                },
+                aa: AaConfig::default(),
+                credentials: vec![],
+                image: ImageConfig::default(),
+                socket: String::new(),
+                protected_resource_uri_prefixes: prefixes,
+                skip_sealed_secret_verification: false,
+                log: LogConfig::default(),
+            },
+            secure_volumes: crate::storage::secure_volume::Manager::default(),
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn secure_volume_fixture(key_uri: &str) -> (Vec<u8>, String) {
+        let key_digest = sha256_hex(VOLUME_KEY);
+        let manifest = format!(
+            r#"{{
+              "schemaVersion": 3,
+              "volumeId": "tenant/workload/volume-1",
+              "volumeVersion": "volume-1-v2",
+              "deviceSizeBytes": 1073741824,
+              "access": "readWrite",
+              "protection": {{
+                "type": "luks2-integrity-rw",
+                "profileVersion": 1,
+                "keyUri": "{key_uri}",
+                "keySha256": "{key_digest}",
+                "luksUuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+              }}
+            }}"#
+        )
+        .into_bytes();
+        let manifest_digest = sha256_hex(&manifest);
+        let manifest_uri = format!("kbs:///tenant/storage-manifests/sha256-{manifest_digest}");
+        (manifest, manifest_uri)
     }
 
     #[tokio::test]
@@ -398,34 +502,13 @@ mod tests {
     #[tokio::test]
     async fn public_resource_guard_blocks_keys_without_affecting_internal_reads() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let hub = Hub {
-            credentials: HashMap::new(),
-            image_client: OnceCell::const_new(),
-            resource_client: ResourceClient::with_client(Box::new(StatefulGetter {
+        let prefixes = vec!["kbs:///default/volume-keys/".to_string()];
+        let hub = test_hub(
+            Box::new(StatefulGetter {
                 calls: calls.clone(),
-            })),
-            protected_resource_prefixes: ProtectedResourcePrefixes::from_config(&[
-                "kbs:///default/volume-keys/".to_string(),
-            ])
-            .unwrap(),
-            #[cfg(feature = "ttrpc")]
-            aa_client: OnceCell::const_new(),
-            config: CdhConfig {
-                kbc: KbsConfig {
-                    name: "offline_fs_kbc".to_string(),
-                    url: String::new(),
-                    kbs_cert: None,
-                },
-                aa: AaConfig::default(),
-                credentials: vec![],
-                image: ImageConfig::default(),
-                socket: String::new(),
-                protected_resource_uri_prefixes: vec!["kbs:///default/volume-keys/".to_string()],
-                skip_sealed_secret_verification: false,
-                log: LogConfig::default(),
-            },
-            secure_volumes: crate::storage::secure_volume::Manager::default(),
-        };
+            }),
+            prefixes,
+        );
 
         let key_uri = "kbs:///default/volume-keys/workspace-1";
         assert!(matches!(
@@ -445,10 +528,16 @@ mod tests {
                 .unwrap();
 
         assert!(!prefixes.allows("kbs:///default/volume-keys/workspace-1"));
+        assert!(!prefixes.allows("kbs:///default/%76olume-keys/workspace-1"));
         assert!(prefixes.allows("kbs:///default/volume-keys-backup/workspace-1"));
         assert!(prefixes.allows("kbs:///default/manifests/workspace-1"));
         assert!(!prefixes.allows("kbs://remote.example/default/manifests/workspace-1"));
         assert!(!prefixes.allows("not-a-resource-uri"));
+
+        assert!(prefixes.protects("kbs:///default/volume-keys/workspace-1"));
+        assert!(!prefixes.protects("kbs:///default/%76olume-keys/workspace-1"));
+        assert!(!ProtectedResourcePrefixes::default()
+            .protects("kbs:///default/volume-keys/workspace-1"));
     }
 
     #[test]
@@ -458,11 +547,71 @@ mod tests {
             "kbs:///default//",
             "kbs://remote.example/default/volume-keys/",
             "kbs:///default/volume-keys/?query=value",
+            "kbs:///default/%76olume-keys/",
         ] {
             assert!(
                 ProtectedResourcePrefixes::from_config(&[prefix.to_string()]).is_err(),
                 "accepted ambiguous protected prefix {prefix}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn secure_volume_requires_a_configured_protected_key_namespace() {
+        let key_uri = "kbs:///tenant/storage-keys/volume-1-v1";
+
+        for prefixes in [vec![], vec!["kbs:///tenant/other-keys/".to_string()]] {
+            let (manifest, manifest_uri) = secure_volume_fixture(key_uri);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let hub = test_hub(
+                Box::new(SequenceGetter {
+                    calls: calls.clone(),
+                    resources: vec![manifest, VOLUME_KEY.to_vec()],
+                }),
+                prefixes,
+            );
+
+            let error = hub
+                .activate_volume(
+                    "invalid-device",
+                    &manifest_uri,
+                    crate::storage::secure_volume::VolumeAccess::ReadWrite,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                Error::SecureVolume(crate::storage::secure_volume::Error::InvalidManifest(_))
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "key must not be fetched");
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_volume_fetches_a_key_only_from_the_protected_namespace() {
+        let key_uri = "kbs:///tenant/storage-keys/volume-1-v1";
+        let (manifest, manifest_uri) = secure_volume_fixture(key_uri);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hub = test_hub(
+            Box::new(SequenceGetter {
+                calls: calls.clone(),
+                resources: vec![manifest, VOLUME_KEY.to_vec()],
+            }),
+            vec!["kbs:///tenant/storage-keys/".to_string()],
+        );
+
+        let error = hub
+            .activate_volume(
+                "invalid-device",
+                &manifest_uri,
+                crate::storage::secure_volume::VolumeAccess::ReadWrite,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::SecureVolume(crate::storage::secure_volume::Error::InvalidDevice(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
