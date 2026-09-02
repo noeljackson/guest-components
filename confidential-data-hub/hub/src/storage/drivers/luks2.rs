@@ -84,6 +84,7 @@ const PERSISTENT_VOLUME_ID_MAX_BYTES: usize = 256;
 pub(crate) const PERSISTENT_KEY_BYTES: usize = 32;
 pub(crate) const PERSISTENT_PROFILE_VERSION: u32 = 1;
 const PERSISTENT_MAPPER_PREFIX: &str = "coco-pv-";
+const PERSISTENT_MAPPER_NAME_DOMAIN: &[u8] = b"coco-cdh-persistent-mapper-v1";
 const ZERO_SCAN_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 // First-use verification is deliberately a complete-device scan. Keep its
 // progress interval below the smallest supported persistent workspace so a
@@ -151,10 +152,6 @@ impl PersistentVolumeId {
     fn digest(&self) -> [u8; 32] {
         Sha256::digest(self.0.as_bytes()).into()
     }
-
-    pub(crate) fn mapper_name(&self) -> String {
-        format!("{PERSISTENT_MAPPER_PREFIX}{}", b64.encode(self.digest()))
-    }
 }
 
 /// The complete measured identity authorized to activate one persistent volume.
@@ -190,7 +187,16 @@ impl PersistentVolumeBinding {
     }
 
     fn mapper_name(&self) -> String {
-        self.volume_id.mapper_name()
+        let mut digest = Sha256::new();
+        digest.update(PERSISTENT_MAPPER_NAME_DOMAIN);
+        digest.update(self.volume_id.digest());
+        digest.update(self.volume_version_digest);
+        digest.update(self.manifest_digest);
+        digest.update(self.profile_version.to_be_bytes());
+        format!(
+            "{PERSISTENT_MAPPER_PREFIX}{}",
+            b64.encode(digest.finalize())
+        )
     }
 
     fn update_hmac(&self, mac: &mut HmacSha256) {
@@ -1812,26 +1818,42 @@ async fn prepare_persistent_mapper(
                 &prepared.mapper_name,
                 &key,
             )?;
-        } else {
-            let mut mapper_opened = false;
-            let open_result =
-                prepared
-                    .device
-                    .run_path_operation(PersistentPathOperation::Open, || {
-                        formatter
-                            .open_persistent_device(
-                                &prepared.device,
-                                header_path,
-                                &prepared.mapper_name,
-                                &key,
-                            )
-                            .context("open persistent LUKS2 device")?;
-                        mapper_opened = true;
-                        Ok(())
-                    });
-            prepared.opened_mapper = mapper_opened;
-            open_result?;
+
+            let mapper_device = block_device_number(&prepared.mapper_path)?;
+            if let Some(mount_point) = mount_point_for_device(mapper_device)? {
+                bail!("unowned persistent mapper is already mounted at {mount_point}")
+            }
+
+            // Manager-owned mappings are rejected before this preparation
+            // path. A mapping found here survived loss of that ownership
+            // state, so its authenticated opening provenance is unknowable.
+            // Never adopt it: close it and reopen it from the verified header
+            // through the pinned device descriptor below.
+            formatter
+                .close_device(&prepared.mapper_name)
+                .context("close unowned persistent mapper before verified reopen")?;
+            if Path::new(&prepared.mapper_path).exists() {
+                bail!("unowned persistent mapper remained active after close")
+            }
         }
+
+        let mut mapper_opened = false;
+        let open_result = prepared
+            .device
+            .run_path_operation(PersistentPathOperation::Open, || {
+                formatter
+                    .open_persistent_device(
+                        &prepared.device,
+                        header_path,
+                        &prepared.mapper_name,
+                        &key,
+                    )
+                    .context("open persistent LUKS2 device")?;
+                mapper_opened = true;
+                Ok(())
+            });
+        prepared.opened_mapper = mapper_opened;
+        open_result?;
         Ok(())
     })();
     if open_result.is_err() {
@@ -2388,10 +2410,8 @@ mod tests {
         let same = PersistentVolumeId::try_from("tenant/example/web-data").unwrap();
         let other = PersistentVolumeId::try_from("tenant/example/database").unwrap();
 
-        assert_eq!(id.mapper_name(), same.mapper_name());
-        assert_ne!(id.mapper_name(), other.mapper_name());
-        assert!(id.mapper_name().starts_with(PERSISTENT_MAPPER_PREFIX));
-        assert!(id.mapper_name().len() < 128);
+        assert_eq!(id, same);
+        assert_ne!(id, other);
 
         let too_long = "a".repeat(PERSISTENT_VOLUME_ID_MAX_BYTES + 1);
         for invalid in [
@@ -2409,6 +2429,57 @@ mod tests {
             );
         }
         assert!(PersistentVolumeId::try_from(too_long.as_str()).is_err());
+    }
+
+    #[test]
+    fn mapper_identity_binds_the_complete_authenticated_generation() {
+        let volume_id = PersistentVolumeId::try_from("tenant/example/web-data").unwrap();
+        let manifest_digest = Sha256::digest(b"manifest:v1").into();
+        let binding = PersistentVolumeBinding::new(
+            volume_id.clone(),
+            "generation-1",
+            manifest_digest,
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let same = PersistentVolumeBinding::new(
+            volume_id.clone(),
+            "generation-1",
+            manifest_digest,
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let other_volume = PersistentVolumeBinding::new(
+            PersistentVolumeId::try_from("tenant/example/database").unwrap(),
+            "generation-1",
+            manifest_digest,
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let other_version = PersistentVolumeBinding::new(
+            volume_id.clone(),
+            "generation-2",
+            manifest_digest,
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let other_manifest = PersistentVolumeBinding::new(
+            volume_id,
+            "generation-1",
+            Sha256::digest(b"manifest:v2").into(),
+            PERSISTENT_PROFILE_VERSION,
+        )
+        .unwrap();
+        let mut other_profile = binding.clone();
+        other_profile.profile_version += 1;
+
+        let mapper_name = binding.mapper_name();
+        assert_eq!(mapper_name, same.mapper_name());
+        for other in [other_volume, other_version, other_manifest, other_profile] {
+            assert_ne!(mapper_name, other.mapper_name());
+        }
+        assert!(mapper_name.starts_with(PERSISTENT_MAPPER_PREFIX));
+        assert!(mapper_name.len() < 128);
     }
 
     #[test]
@@ -2798,6 +2869,80 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires root, cryptsetup, loop devices, mkfs, blkid, and device-mapper access"]
+    #[serial]
+    async fn persistent_luks2_reopens_an_unowned_mapper_from_the_verified_header() {
+        let device = TempFileLoopDevice::new(128 * 1024 * 1024).unwrap();
+        let mount_directory = tempfile::tempdir().unwrap();
+        let binding = persistent_binding("tenant/workload/unowned-mapper");
+        let mapper_name = binding.mapper_name();
+        let mapper_path = format!("/dev/mapper/{mapper_name}");
+        let _resources = PersistentResourcesOnDrop {
+            mapper_name: mapper_name.clone(),
+            mount_point: mount_directory.path().to_str().unwrap().to_string(),
+        };
+        let key = TEST_PERSISTENT_KEY;
+        let formatter = Luks2Formatter::default().with_integrity(true);
+
+        activate_test_volume(device.dev_path(), key, binding.clone())
+            .await
+            .unwrap();
+        formatter.close_device(&mapper_name).unwrap();
+
+        let pinned_device = PinnedPersistentDevice::open(
+            device.dev_path(),
+            block_device_number(device.dev_path()).unwrap(),
+        )
+        .unwrap();
+        let auth_key = derive_persistent_auth_key(key, &binding).unwrap();
+        let record = load_persistent_metadata(&pinned_device.file, &auth_key, &binding)
+            .unwrap()
+            .unwrap();
+        let header =
+            load_verified_header(&pinned_device.file, &record, &auth_key, &binding).unwrap();
+        let device_argument = pinned_device.cryptsetup_argument();
+        pinned_device
+            .run_cryptsetup(
+                &[
+                    "luksOpen",
+                    "--readonly",
+                    "--header",
+                    header.path().to_str().unwrap(),
+                    "--keyfile-size",
+                    PERSISTENT_KEYFILE_BYTES,
+                    "-d",
+                    "-",
+                    &device_argument,
+                    &mapper_name,
+                ],
+                Some(key),
+            )
+            .unwrap();
+
+        let mapper_device = block_device_number(&mapper_path).unwrap();
+        let read_only_path = format!(
+            "/sys/dev/block/{}:{}/ro",
+            mapper_device.major, mapper_device.minor
+        );
+        assert_eq!(
+            std::fs::read_to_string(&read_only_path).unwrap().trim(),
+            "1"
+        );
+
+        activate_test_volume(device.dev_path(), key, binding)
+            .await
+            .unwrap();
+
+        let mapper_device = block_device_number(&mapper_path).unwrap();
+        let read_only_path = format!(
+            "/sys/dev/block/{}:{}/ro",
+            mapper_device.major, mapper_device.minor
+        );
+        assert_eq!(std::fs::read_to_string(read_only_path).unwrap().trim(), "0");
     }
 
     #[cfg(target_os = "linux")]
