@@ -641,6 +641,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_percent_encoded_key_uri_alias() {
+        let bytes = String::from_utf8(valid_manifest())
+            .unwrap()
+            .replace("tenant/storage-keys", "tenant/%73torage-keys");
+        assert!(matches!(
+            Manifest::parse(bytes.as_bytes()),
+            Err(Error::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
     fn rejects_unaligned_device_size() {
         let bytes = String::from_utf8(valid_manifest())
             .unwrap()
