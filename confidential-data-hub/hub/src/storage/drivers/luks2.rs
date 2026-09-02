@@ -1404,9 +1404,14 @@ struct PersistentLuksSegment {
 struct PersistentLuksIntegrity {
     #[serde(rename = "type")]
     integrity_type: String,
+    #[serde(default = "default_persistent_integrity_key_size")]
     key_size: u64,
     journal_encryption: String,
     journal_integrity: String,
+}
+
+const fn default_persistent_integrity_key_size() -> u64 {
+    PERSISTENT_INTEGRITY_KEY_BYTES
 }
 
 #[derive(Debug, Deserialize)]
@@ -1545,6 +1550,11 @@ fn validate_persistent_luks_metadata_json(json: &str) -> Result<()> {
         segment.integrity.integrity_type.as_str(),
         HMAC_SHA256_STATUS,
     )?;
+    // Cryptsetup 2.8.7 omits this redundant field. The checks above still bind
+    // the combined volume key to 96 bytes and the AES-XTS data key to 64 bytes,
+    // which leaves exactly the required 32-byte HMAC-SHA256 key. Serde supplies
+    // that value only when the field is absent; null does not deserialize, and
+    // older releases that emit a value must agree with the same derivation.
     require_profile_field(
         "segment.integrity.key_size",
         segment.integrity.key_size,
@@ -2198,6 +2208,7 @@ mod tests {
     fn effective_luks_metadata_must_match_the_complete_profile() {
         let valid = persistent_luks_metadata_fixture();
         validate_persistent_luks_metadata_json(valid).unwrap();
+        validate_persistent_luks_metadata_json(&valid.replace(",\"key_size\":32", "")).unwrap();
 
         for (invalid, expected_error) in [
             (
@@ -2216,6 +2227,14 @@ mod tests {
             (
                 valid.replace("\"sector_size\":4096", "\"sector_size\":512"),
                 "segment",
+            ),
+            (
+                valid.replace("\"key_size\":32", "\"key_size\":16"),
+                "segment.integrity.key_size",
+            ),
+            (
+                valid.replace("\"key_size\":32", "\"key_size\":null"),
+                "parse persistent LUKS2 JSON metadata",
             ),
             (
                 valid.replace("\"tokens\":{}", "\"tokens\":{\"0\":{}}"),
