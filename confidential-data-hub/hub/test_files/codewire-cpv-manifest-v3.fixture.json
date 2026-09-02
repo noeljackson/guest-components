@@ -1,0 +1,4 @@
+{
+  "manifestUri": "kbs:///default/codewire-storage-manifests/sha256-de7120550b6e85aea6e1e436158e595a61048d46e121870e46595e9fdad0d3ec",
+  "canonicalManifest": "{\"schemaVersion\":3,\"volumeId\":\"be31063a-8ec8-46d5-aa17-75cda1729370\",\"volumeVersion\":\"be31063a-8ec8-46d5-aa17-75cda1729370-v3\",\"deviceSizeBytes\":21474836480,\"access\":\"readWrite\",\"protection\":{\"type\":\"luks2-integrity-rw\",\"profileVersion\":1,\"keyUri\":\"kbs:///default/codewire-workspace-luks/be31063a-8ec8-46d5-aa17-75cda1729370\",\"keySha256\":\"60bf07c488aad18fda339df07e4fbc47b4f00be71711936f18d04d352ad01890\",\"luksUuid\":\"f617a73e-b03d-4b58-b1ae-354c72276ea0\"}}"
+}

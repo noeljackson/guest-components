@@ -540,6 +540,42 @@ mod tests {
     }
 
     #[test]
+    fn codewire_documented_manifest_fixture_matches_current_contract() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../test_files/codewire-cpv-manifest-v3.fixture.json"
+        ))
+        .unwrap();
+        let bytes = fixture["canonicalManifest"].as_str().unwrap().as_bytes();
+        let uri = fixture["manifestUri"].as_str().unwrap();
+
+        assert_eq!(
+            uri,
+            "kbs:///default/codewire-storage-manifests/sha256-de7120550b6e85aea6e1e436158e595a61048d46e121870e46595e9fdad0d3ec"
+        );
+        assert_eq!(
+            uri,
+            format!(
+                "kbs:///default/codewire-storage-manifests/{SHA256_TAG_PREFIX}{}",
+                sha256_hex(bytes)
+            )
+        );
+
+        let manifest = Manifest::parse_bound(bytes, uri).unwrap();
+        assert_eq!(manifest.schema_version, SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            manifest.protection.profile_version,
+            PERSISTENT_PROFILE_VERSION
+        );
+        assert_eq!(
+            manifest.protection.key_uri,
+            "kbs:///default/codewire-workspace-luks/be31063a-8ec8-46d5-aa17-75cda1729370"
+        );
+        manifest.verify_key(&[0x5a; PERSISTENT_KEY_BYTES]).unwrap();
+        manifest.persistent_binding().unwrap();
+        manifest.ensure_access(VolumeAccess::ReadWrite).unwrap();
+    }
+
+    #[test]
     fn packaged_contract_oracle_covers_schema_and_profile() {
         assert_eq!(verify_packaged_contract().unwrap(), (3, 1));
     }
