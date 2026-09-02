@@ -15,8 +15,6 @@ use protos::ttrpc::aa::{
 };
 use ttrpc::context;
 
-mod ttrpc_dep;
-
 const TIMEOUT: i64 = 5 * 1000 * 1000 * 1000;
 
 const DEFAULT_UNIX_SOCKET_DIR: &str = "/run/confidential-containers/attestation-agent/";
