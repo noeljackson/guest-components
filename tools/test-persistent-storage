@@ -39,6 +39,7 @@ fi
 readonly unit_test='storage::drivers::luks2::tests::effective_luks_metadata_must_match_the_complete_profile'
 readonly -a root_tests=(
 	'storage::drivers::luks2::tests::persistent_luks2_loop_lifecycle_and_init_recovery'
+	'storage::drivers::luks2::tests::persistent_luks2_reopens_an_unowned_mapper_from_the_verified_header'
 	'storage::drivers::luks2::tests::persistent_luks2_rejects_a_modified_header_before_opening_it'
 	'storage::drivers::luks2::tests::persistent_luks2_detects_corrupted_payload'
 	'storage::drivers::luks2::tests::persistent_luks2_recovers_across_initialization_phase_boundaries'
