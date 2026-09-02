@@ -55,7 +55,6 @@ const HMAC_SHA256_STATUS: &str = "hmac(sha256)";
 const SECTOR_SIZE: u32 = 4096;
 const PERSISTENT_DATA_KEY_BITS: u64 = 512;
 const PERSISTENT_DATA_KEY_BYTES: u64 = 64;
-const PERSISTENT_INTEGRITY_KEY_BITS: u64 = 256;
 const PERSISTENT_INTEGRITY_KEY_BYTES: u64 = 32;
 // LUKS2 records the combined dm-crypt and dm-integrity volume key in its
 // keyslot metadata. HMAC-SHA256 therefore adds its 256-bit integrity key to
@@ -855,12 +854,11 @@ fn luks_format_arguments(
         args.extend(["--uuid".to_string(), luks_uuid.to_string()]);
     }
     if integrity {
-        args.extend([
-            "--integrity".to_string(),
-            HMAC_SHA256.to_string(),
-            "--integrity-key-size".to_string(),
-            PERSISTENT_INTEGRITY_KEY_BITS.to_string(),
-        ]);
+        // cryptsetup derives the HMAC-SHA256 integrity key size from the
+        // algorithm. Older supported cryptsetup releases do not accept an
+        // explicit --integrity-key-size for luksFormat; the metadata check
+        // below still requires the derived 32-byte key before use.
+        args.extend(["--integrity".to_string(), HMAC_SHA256.to_string()]);
         if integrity_initialization == IntegrityInitialization::SkipWipeWithoutJournal {
             args.extend([
                 "--integrity-no-wipe".to_string(),
@@ -2144,8 +2142,6 @@ mod tests {
                 "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
                 "--integrity",
                 "hmac-sha256",
-                "--integrity-key-size",
-                "256",
                 "/dev/vdb",
                 "-",
             ]
