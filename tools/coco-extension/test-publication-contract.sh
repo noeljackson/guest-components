@@ -63,8 +63,16 @@ verify_contract() {
 		printf 'publication workflow must select downstream/confidential-storage exactly once\n' >&2
 		return 1
 	}
+	[[ "$(wc -l <<<"${branches}")" -eq 2 ]] || {
+		printf 'publication workflow must select only main and downstream/confidential-storage\n' >&2
+		return 1
+	}
 	if grep -Fq 'workflow_dispatch:' "${candidate}"; then
 		printf 'publication workflow must not expose manual dispatch\n' >&2
+		return 1
+	fi
+	if grep -Eq '^[[:space:]]+ref:' "${candidate}"; then
+		printf 'publication checkout must use the event exact commit\n' >&2
 		return 1
 	fi
 
@@ -103,6 +111,24 @@ stale_workflow="${test_root}/main-only.yml"
 sed '/^    - downstream\/confidential-storage$/d' "${workflow}" >"${stale_workflow}"
 if verify_contract "${stale_workflow}" >/dev/null 2>&1; then
 	printf 'main-only publication fixture unexpectedly satisfied the contract\n' >&2
+	exit 1
+fi
+
+# The upstreamable source branch must never become a publication trigger.
+source_trigger_workflow="${test_root}/source-trigger.yml"
+sed '/^    - downstream\/confidential-storage$/a\    - downstream/confidential-storage-source' \
+	"${workflow}" >"${source_trigger_workflow}"
+if verify_contract "${source_trigger_workflow}" >/dev/null 2>&1; then
+	printf 'source-branch publication fixture unexpectedly satisfied the contract\n' >&2
+	exit 1
+fi
+
+# Deployment must build the immutable event commit, not a moving source branch.
+moving_source_workflow="${test_root}/moving-source.yml"
+sed '/^        persist-credentials: false$/a\        ref: downstream/confidential-storage-source' \
+	"${workflow}" >"${moving_source_workflow}"
+if verify_contract "${moving_source_workflow}" >/dev/null 2>&1; then
+	printf 'moving-source checkout fixture unexpectedly satisfied the contract\n' >&2
 	exit 1
 fi
 
