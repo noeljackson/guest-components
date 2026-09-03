@@ -19,9 +19,13 @@
 # directly or convert the image into an EROFS + dm-verity extension disk image.
 FROM scratch
 
+ARG SOURCE_REPOSITORY=https://github.com/confidential-containers/guest-components
+ARG SOURCE_REVISION=unknown
+
 LABEL org.opencontainers.image.title="CoCo guest extension" \
       org.opencontainers.image.description="Confidential Containers guest components packaged as a kata composable guest extension" \
-      org.opencontainers.image.source="https://github.com/confidential-containers/guest-components" \
+      org.opencontainers.image.source="${SOURCE_REPOSITORY}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY . /
