@@ -16,17 +16,19 @@ name: Build and publish the CoCo guest extension image
 # extension ships no libc, so a variant is only usable on a matching guest.
 #
 # On pull requests everything is built and uploaded as workflow artifacts (no
-# registry push). On pushes to main the artifacts are published to ghcr.io
-# (tagged with the commit sha and "latest") and attested. On a published
-# release the same artifacts are published tagged with the release version, the
-# multi-arch manifests get the version tag, and the per-arch disk images and
-# their dm-verity root hashes are attached to the GitHub release so consumers
-# (e.g. kata-containers) can pin to a stable version.
+# registry push). Pushes to main and downstream/confidential-storage publish
+# commit-qualified artifacts to ghcr.io and attest them. Only main also moves
+# the friendly "latest" tag. On a published release the same artifacts are
+# published tagged with the release version, the multi-arch manifests get the
+# version tag, and the per-arch disk images and their dm-verity root hashes are
+# attached to the GitHub release so consumers (e.g. kata-containers) can pin to
+# a stable version.
 on:
   pull_request:
   push:
     branches:
     - main
+    - downstream/confidential-storage
   release:
     types: [published]
 
@@ -186,6 +188,9 @@ jobs:
     - name: Verify current-source build dispatch
       run: ./tools/coco-extension/test-build-source-freshness.sh
 
+    - name: Verify downstream publication contract
+      run: ./tools/coco-extension/test-publication-contract.sh
+
     - name: Assemble extension rootfs
       run: |
         docker run --rm \
@@ -205,9 +210,12 @@ jobs:
       env:
         GIT_SHA: ${{ github.sha }}
         OCI_ARCH: ${{ matrix.oci_arch }}
+        SOURCE_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
       run: |
         docker build \
           -f tools/coco-extension/Dockerfile \
+          --build-arg "SOURCE_REPOSITORY=${SOURCE_REPOSITORY}" \
+          --build-arg "SOURCE_REVISION=${GIT_SHA}" \
           -t "${CONTAINER_IMAGE}:${GIT_SHA}-${VARIANT}-${OCI_ARCH}" \
           build/coco-extension-rootfs
 
@@ -240,7 +248,7 @@ jobs:
         retention-days: 15
         if-no-files-found: error
 
-    # --- Push to main / release: publish to ghcr.io and attest ----------------
+    # --- Authorized branch push / release: publish and attest -----------------
     # The immutable per-arch reference is always "<sha>-<variant>-<arch>"; the
     # friendly tags (latest, or the release version) are assembled into
     # per-variant multi-arch manifests in the publish-manifests job below.
@@ -288,6 +296,25 @@ jobs:
       with:
         subject-name: ${{ steps.publish-container.outputs.image }}
         subject-digest: ${{ steps.publish-container.outputs.digest }}
+        push-to-registry: true
+
+    - name: Generate SPDX SBOM for the OCI container image
+      if: ${{ github.event_name != 'pull_request' }}
+      uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      with:
+        image: ${{ steps.publish-container.outputs.image }}@${{ steps.publish-container.outputs.digest }}
+        format: spdx-json
+        output-file: build/coco-extension.spdx.json
+        upload-artifact: false
+        dependency-snapshot: false
+
+    - name: Generate SBOM attestation for the OCI container image
+      if: ${{ github.event_name != 'pull_request' }}
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      with:
+        subject-name: ${{ steps.publish-container.outputs.image }}
+        subject-digest: ${{ steps.publish-container.outputs.digest }}
+        sbom-path: build/coco-extension.spdx.json
         push-to-registry: true
 
     - name: Generate provenance for the disk image
@@ -348,14 +375,17 @@ jobs:
 
     - name: Assemble multi-arch manifests
       env:
-        # On push to main: the commit sha plus the rolling "latest" tag.
-        # On release: the commit sha plus the immutable release version, so
-        # consumers can pin to it.
-        EXTRA_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || 'latest' }}
+        # A downstream push only publishes the immutable commit tag. Main also
+        # moves "latest"; a release adds its immutable release version.
+        EXTRA_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || (github.ref == 'refs/heads/main' && 'latest' || '') }}
         GIT_SHA: ${{ github.sha }}
       run: |
         for image in "${CONTAINER_IMAGE}" "${DISK_IMAGE}"; do
-          for tag in "${GIT_SHA}-${VARIANT}" "${EXTRA_TAG}-${VARIANT}"; do
+          tags=("${GIT_SHA}-${VARIANT}")
+          if [ -n "${EXTRA_TAG}" ]; then
+            tags+=("${EXTRA_TAG}-${VARIANT}")
+          fi
+          for tag in "${tags[@]}"; do
             docker manifest create "${image}:${tag}" \
               --amend "${image}:${GIT_SHA}-${VARIANT}-amd64" \
               --amend "${image}:${GIT_SHA}-${VARIANT}-arm64" \
