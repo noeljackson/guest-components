@@ -6,26 +6,30 @@ use anyhow::Result;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use oci_client::{
     client::ClientConfig,
+    errors::OciDistributionError,
     manifest::{OciDescriptor, OciImageManifest},
     secrets::RegistryAuth,
     Client, Reference,
 };
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::{collections::BTreeMap, error::Error as StdError, future::Future, io};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
+use tracing::warn;
 
 use crate::decoder::Compression;
 use crate::layer_store::LayerStore;
 use crate::meta_store::MetaStore;
-use crate::stream::stream_processing;
+use crate::stream::{stream_processing, LayerBlobStreamError};
 use crate::{
     decoder::DecodeError,
     decrypt::{DecryptLayerError, Decryptor},
 };
 use crate::{image::LayerMeta, stream::StreamError};
+
+const MAX_LAYER_PULL_ATTEMPTS: usize = 2;
 
 pub type PullLayerResult<T> = std::result::Result<T, PullLayerError>;
 
@@ -63,6 +67,87 @@ pub enum PullLayerError {
 
     #[error("Failed to decode layer data stream: {0}")]
     HandleStreamError(#[from] StreamError),
+}
+
+impl PullLayerError {
+    fn is_retryable_transport_failure(&self) -> bool {
+        match self {
+            Self::PullBlobStramFailed { source } => retryable_oci_request_error(source),
+            Self::HandleStreamError(source) => error_chain_contains_layer_blob_stream(source),
+            _ => false,
+        }
+    }
+}
+
+fn retryable_oci_request_error(error: &OciDistributionError) -> bool {
+    match error {
+        OciDistributionError::IoError(source) => matches!(
+            source.kind(),
+            io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::TimedOut
+                | io::ErrorKind::UnexpectedEof
+        ),
+        OciDistributionError::RequestError(source) => {
+            source.is_timeout() || source.is_connect() || source.is_body()
+        }
+        OciDistributionError::ServerError { code, .. } => {
+            matches!(*code, 408 | 425 | 429 | 500..=599)
+        }
+        _ => false,
+    }
+}
+
+fn error_chain_contains_layer_blob_stream(error: &(dyn StdError + 'static)) -> bool {
+    let mut current = Some(error);
+    for _ in 0..8 {
+        let Some(cause) = current else {
+            break;
+        };
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            if io_error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<LayerBlobStreamError>())
+            {
+                return true;
+            }
+        }
+        if cause.is::<LayerBlobStreamError>() {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
+}
+
+async fn retry_layer_operation<T, F, Fut>(
+    layer_digest: &str,
+    mut operation: F,
+) -> PullLayerResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = PullLayerResult<T>>,
+{
+    for attempt in 1..=MAX_LAYER_PULL_ATTEMPTS {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < MAX_LAYER_PULL_ATTEMPTS && error.is_retryable_transport_failure() =>
+            {
+                warn!(
+                    layer_digest,
+                    attempt,
+                    max_attempts = MAX_LAYER_PULL_ATTEMPTS,
+                    "retrying failed OCI layer transport from a clean destination"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("bounded layer retry loop always returns")
 }
 
 /// The PullClient connects to remote OCI registry, pulls the container image,
@@ -128,19 +213,31 @@ impl<'a> PullClient<'a> {
         let layer_metas: Vec<(usize, LayerMeta)> = stream::iter(layer_descs)
             .enumerate()
             .map(|(i, layer)| async move {
-                let layer_stream = self
-                    .client
-                    .pull_blob_stream(&self.reference, &layer)
-                    .await
-                    .map_err(|source| PullLayerError::PullBlobStramFailed { source })?;
-                let layer_reader = StreamReader::new(layer_stream.stream);
-                self.async_handle_layer(
-                    layer,
-                    diff_ids[i].clone(),
-                    decrypt_config,
-                    layer_reader,
-                    meta_store.clone(),
-                )
+                let layer_digest = layer.digest.clone();
+                retry_layer_operation(&layer_digest, || {
+                    let layer = layer.clone();
+                    let diff_id = diff_ids[i].clone();
+                    let meta_store = meta_store.clone();
+                    async move {
+                        let layer_stream = self
+                            .client
+                            .pull_blob_stream(&self.reference, &layer)
+                            .await
+                            .map_err(|source| PullLayerError::PullBlobStramFailed { source })?;
+                        let layer_reader =
+                            StreamReader::new(layer_stream.stream.map_err(|source| {
+                                io::Error::new(source.kind(), LayerBlobStreamError { source })
+                            }));
+                        self.async_handle_layer(
+                            layer,
+                            diff_id,
+                            decrypt_config,
+                            layer_reader,
+                            meta_store,
+                        )
+                        .await
+                    }
+                })
                 .await
                 .map(|layer_meta| (i, layer_meta))
             })
@@ -238,12 +335,116 @@ impl<'a> PullClient<'a> {
 mod tests {
     use super::*;
     use crate::config::DEFAULT_MAX_CONCURRENT_DOWNLOAD;
+    use crate::stream::UnpackError;
     use flate2::write::GzEncoder;
     use oci_client::manifest::IMAGE_CONFIG_MEDIA_TYPE;
     use oci_spec::image::{ImageConfiguration, MediaType};
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use test_utils::{assert_result, assert_retry};
+
+    fn marked_blob_stream_error() -> PullLayerError {
+        PullLayerError::HandleStreamError(StreamError::UnPackLayerFailed(
+            UnpackError::UnpackFailed {
+                source: io::Error::other(LayerBlobStreamError {
+                    source: io::Error::from(io::ErrorKind::UnexpectedEof),
+                }),
+            },
+        ))
+    }
+
+    fn local_unpack_error(kind: io::ErrorKind) -> PullLayerError {
+        PullLayerError::HandleStreamError(StreamError::UnPackLayerFailed(
+            UnpackError::UnpackFailed {
+                source: io::Error::from(kind),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn retries_a_marked_blob_stream_from_a_fresh_attempt() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_layer_operation("sha256:test", || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(marked_blob_stream_error())
+                } else {
+                    Ok("complete")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "complete");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bounds_repeated_blob_stream_failures_at_two_attempts() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_layer_operation::<(), _, _>("sha256:test", || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            async { Err(marked_blob_stream_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_LAYER_PULL_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_local_unpack_failures() {
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::StorageFull] {
+            let attempts = AtomicUsize::new(0);
+            let result = retry_layer_operation::<(), _, _>("sha256:test", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(local_unpack_error(kind)) }
+            })
+            .await;
+
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "I/O kind {kind:?}");
+        }
+    }
+
+    #[test]
+    fn does_not_retry_digest_or_content_failures() {
+        let failures = [
+            PullLayerError::UnequalUncompressedDigest {
+                uncompressed_digest: "sha256:actual".into(),
+                diff_id: "sha256:expected".into(),
+            },
+            PullLayerError::HandleStreamError(StreamError::UnsupportedDigestFormat(
+                "sha384:unsupported".into(),
+            )),
+            PullLayerError::DecodeError(DecodeError::BadMediaType(IMAGE_CONFIG_MEDIA_TYPE.into())),
+        ];
+
+        for failure in failures {
+            assert!(!failure.is_retryable_transport_failure(), "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn retries_only_transient_pre_stream_registry_errors() {
+        let unavailable = PullLayerError::PullBlobStramFailed {
+            source: OciDistributionError::ServerError {
+                code: 503,
+                url: "https://registry.example.invalid/blob".into(),
+                message: "unavailable".into(),
+            },
+        };
+        let unauthorized = PullLayerError::PullBlobStramFailed {
+            source: OciDistributionError::UnauthorizedError {
+                url: "https://registry.example.invalid/blob".into(),
+            },
+        };
+
+        assert!(unavailable.is_retryable_transport_failure());
+        assert!(!unauthorized.is_retryable_transport_failure());
+    }
 
     #[ignore]
     #[tokio::test]

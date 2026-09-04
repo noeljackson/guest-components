@@ -21,6 +21,7 @@ pub struct KbsTokenGetter {
     kbs_host_url: String,
     cert: Option<String>,
     tee_key_algorithm: TeeKeyAlgorithm,
+    attestation_policy_selector: String,
     request_timeout: Option<Duration>,
 }
 
@@ -37,6 +38,10 @@ impl KbsTokenGetter {
         builder = builder.set_tee_key_algorithm(self.tee_key_algorithm);
         if let Some(request_timeout) = self.request_timeout {
             builder = builder.set_request_timeout(request_timeout);
+        }
+
+        if !self.attestation_policy_selector.is_empty() {
+            builder = builder.set_attestation_policy_selector(&self.attestation_policy_selector);
         }
 
         if let Some(initdata) = initdata {
@@ -62,6 +67,7 @@ impl KbsTokenGetter {
             kbs_host_url: config.url.clone(),
             cert: config.cert.clone(),
             tee_key_algorithm: config.tee_key_algorithm,
+            attestation_policy_selector: config.attestation_policy_selector.clone(),
             request_timeout: None,
         }
     }
@@ -83,6 +89,7 @@ mod tests {
             url: "https://kbs.example.test".to_string(),
             cert: None,
             tee_key_algorithm: TeeKeyAlgorithm::default(),
+            attestation_policy_selector: String::new(),
         }
     }
 

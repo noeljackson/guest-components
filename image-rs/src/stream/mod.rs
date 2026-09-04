@@ -19,6 +19,17 @@ use crate::digest::{DigestHasher, LayerDigestHasher, DIGEST_SHA256_PREFIX, DIGES
 
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Marks an error that originated in the remote OCI layer response body before
+/// decompression or filesystem extraction. The stable display deliberately
+/// omits the nested HTTP error because redirected blob URLs can contain signed
+/// query parameters.
+#[derive(Error, Debug)]
+#[error("OCI layer body stream failed")]
+pub(crate) struct LayerBlobStreamError {
+    #[source]
+    pub(crate) source: std::io::Error,
+}
+
 #[derive(Error, Debug)]
 pub enum StreamError {
     #[error("Failed to roll back when unpacking")]
@@ -114,10 +125,40 @@ async fn async_processing(
 mod tests {
     use super::*;
     use ring::rand::SecureRandom;
+    use std::io;
     use tokio::{
         fs::File,
-        io::{AsyncReadExt, BufReader},
+        io::{AsyncReadExt, BufReader, ReadBuf},
     };
+
+    struct MarkedFailingReader {
+        data: Vec<u8>,
+        position: usize,
+        failed: bool,
+    }
+
+    impl AsyncRead for MarkedFailingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.position < self.data.len() {
+                let remaining = &self.data[self.position..];
+                let length = remaining.len().min(buffer.remaining());
+                buffer.put_slice(&remaining[..length]);
+                self.position += length;
+                return Poll::Ready(Ok(()));
+            }
+            if !self.failed {
+                self.failed = true;
+                return Poll::Ready(Err(io::Error::other(LayerBlobStreamError {
+                    source: io::Error::from(io::ErrorKind::UnexpectedEof),
+                })));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
     use tokio_tar::{Builder, Header};
 
     #[tokio::test]
@@ -159,6 +200,43 @@ mod tests {
         reader.read_to_end(&mut buffer).await.unwrap();
         let data_digest_new = sha2::Sha256::digest(buffer);
         assert_eq!(data_digest, data_digest_new);
+    }
+
+    #[tokio::test]
+    async fn marked_body_stream_failure_is_visible_and_rolls_back() {
+        let data = [b'x'; 100_000];
+        let mut archive = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_size(data.len().try_into().unwrap());
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "usr/local/bin/cw", data.as_slice())
+            .await
+            .unwrap();
+        let tar = archive.into_inner().await.unwrap();
+        let reader = MarkedFailingReader {
+            data: tar[..1024].to_vec(),
+            position: 0,
+            failed: false,
+        };
+        let tempdir = tempfile::tempdir().unwrap();
+        let destination = tempdir.path().join("layer");
+
+        let error = async_processing(
+            reader,
+            LayerDigestHasher::Sha256(sha2::Sha256::new()),
+            destination.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("OCI layer body stream failed"),
+            "{error:#?}"
+        );
+        assert!(!destination.exists());
     }
 
     #[tokio::test]
