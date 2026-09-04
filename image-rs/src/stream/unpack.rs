@@ -14,7 +14,9 @@ use tracing::{debug, warn};
 use std::{
     collections::HashMap,
     convert::TryInto,
+    error::Error as StdError,
     ffi::CString,
+    fmt,
     fs::Permissions,
     io,
     os::{
@@ -26,6 +28,8 @@ use std::{
 use tokio::{fs, io::AsyncRead};
 use tokio_tar::{Archive, ArchiveBuilder, Entry};
 use xattr::FileExt;
+
+use super::LayerBlobStreamError;
 
 pub type UnpackResult<T> = std::result::Result<T, UnpackError>;
 
@@ -43,7 +47,7 @@ pub enum UnpackError {
         source: io::Error,
     },
 
-    #[error("Failed to read entries from the tar")]
+    #[error("Failed to read entries from the tar: {}", IoErrorChain(.source))]
     ReadTarEntriesFailed {
         #[source]
         source: io::Error,
@@ -76,7 +80,7 @@ pub enum UnpackError {
         source: anyhow::Error,
     },
 
-    #[error("Failed to unpack layer to destination: {source}")]
+    #[error("Failed to unpack layer to destination: {}", IoErrorChain(.source))]
     UnpackFailed {
         #[source]
         source: io::Error,
@@ -108,6 +112,47 @@ pub enum UnpackError {
         #[source]
         source: pathrs::error::Error,
     },
+}
+
+/// Render the bounded source chain of an I/O error without losing its stable
+/// [`io::ErrorKind`]. `astral-tokio-tar` intentionally displays only the tar
+/// member path, while retaining the actionable read/write error as its source.
+/// Keeping that source visible is necessary to distinguish a failed registry
+/// body stream from a local storage or permission failure.
+struct IoErrorChain<'a>(&'a io::Error);
+
+impl fmt::Display for IoErrorChain<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut previous = self.0.to_string();
+        write!(formatter, "{} [io_kind={:?}]", previous, self.0.kind())?;
+
+        let mut source = self.0.source();
+        for _ in 0..4 {
+            let Some(cause) = source else {
+                break;
+            };
+            if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+                if let Some(inner) = io_error.get_ref() {
+                    if inner.is::<LayerBlobStreamError>() {
+                        write!(formatter, ": {inner}")?;
+                        break;
+                    }
+                }
+            }
+            if cause.is::<LayerBlobStreamError>() {
+                write!(formatter, ": {cause}")?;
+                break;
+            }
+            let rendered = cause.to_string();
+            if rendered != previous {
+                write!(formatter, ": {rendered}")?;
+                previous = rendered;
+            }
+            source = cause.source();
+        }
+
+        Ok(())
+    }
 }
 
 // TODO: Add unit tests for both xattr supporting case and
@@ -584,6 +629,7 @@ mod tests {
         let error = UnpackError::UnpackFailed { source };
 
         assert!(error.to_string().contains(&source_message));
+        assert!(error.to_string().contains("io_kind=PermissionDenied"));
     }
 
     #[tokio::test]
