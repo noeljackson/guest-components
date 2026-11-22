@@ -40,16 +40,27 @@ pub const CONFIGURATION_FILE_NAME: &str = "config.json";
 /// One registry host and the address a pull reaches it at.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct RegistryAddress {
-    /// The registry's host name, as an image reference names it, with no
-    /// port. Matched without regard to case.
+    /// The registry's host name as the pull resolves it, with no port, matched
+    /// without regard to case. For Docker Hub that is `index.docker.io`, not
+    /// `docker.io`.
     pub host: String,
     /// The address to connect to. The port stays the reference's.
     pub address: IpAddr,
 }
 
 /// Refuses an empty host, a host that is itself an address or carries a port
-/// or path, and a host listed twice.
-pub fn validate_registry_addresses(addresses: &[RegistryAddress]) -> Result<()> {
+/// or path, and a host listed twice. Also refuses any fixed address alongside
+/// an HTTPS pull proxy: the proxy resolves the host itself, so the address
+/// would go unused without a word.
+pub fn validate_registry_addresses(
+    addresses: &[RegistryAddress],
+    image_pull_proxy: Option<&ProxyConfig>,
+) -> Result<()> {
+    if !addresses.is_empty() && image_pull_proxy.is_some_and(|proxy| proxy.https_proxy.is_some()) {
+        return Err(anyhow!(
+            "registry addresses can't be used with an https image pull proxy"
+        ));
+    }
     let mut seen = std::collections::HashSet::new();
     for entry in addresses {
         let host = entry.host.as_str();
@@ -647,7 +658,7 @@ mod tests {
             config.registry_addresses,
             vec![entry("registry.example", "192.0.2.10")]
         );
-        validate_registry_addresses(&config.registry_addresses).unwrap();
+        validate_registry_addresses(&config.registry_addresses, None).unwrap();
     }
 
     #[test]
@@ -666,7 +677,27 @@ mod tests {
     #[case::path(vec![entry("registry.example/codewire", "10.0.0.1")])]
     #[case::twice(vec![entry("registry.example", "10.0.0.1"), entry("Registry.Example", "10.0.0.2")])]
     fn bad_registry_addresses_are_refused(#[case] addresses: Vec<RegistryAddress>) {
-        assert!(validate_registry_addresses(&addresses).is_err());
+        assert!(validate_registry_addresses(&addresses, None).is_err());
+    }
+
+    #[test]
+    fn registry_addresses_are_refused_with_an_https_proxy() {
+        let addresses = vec![entry("registry.example", "192.0.2.10")];
+        let https = ProxyConfig {
+            https_proxy: Some("http://192.0.2.99:3128".into()),
+            http_proxy: None,
+            no_proxy: None,
+        };
+        assert!(validate_registry_addresses(&addresses, Some(&https)).is_err());
+        // No addresses, no conflict; an http-only proxy never carries these
+        // pulls, which are HTTPS only.
+        validate_registry_addresses(&[], Some(&https)).unwrap();
+        let http_only = ProxyConfig {
+            https_proxy: None,
+            http_proxy: Some("http://192.0.2.99:3128".into()),
+            no_proxy: None,
+        };
+        validate_registry_addresses(&addresses, Some(&http_only)).unwrap();
     }
 
     #[test]
