@@ -99,6 +99,9 @@ impl ClientBuilder {
     __impl_config!(kbs_uri, kbs_uri, String);
 
     pub async fn build(self) -> BuilderResult<ImageClient> {
+        crate::config::validate_registry_addresses(&self.config.registry_addresses)
+            .map_err(|source| BuilderError::InvalidRegistryConfiguration { source })?;
+
         #[cfg(feature = "keywrap-native")]
         let resource_provider = Arc::new(ResourceProvider::new_with_timeout(
             &self.config.kbc,

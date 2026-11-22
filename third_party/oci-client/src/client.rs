@@ -356,6 +356,14 @@ impl TryFrom<ClientConfig> for Client {
             client_builder = client_builder.proxy(proxy);
         }
 
+        if !config.resolve.is_empty() {
+            client_builder = client_builder.https_only(true);
+            for (host, address) in &config.resolve {
+                client_builder =
+                    client_builder.resolve(host, std::net::SocketAddr::new(*address, 0));
+            }
+        }
+
         let default_token_expiration_secs = config.default_token_expiration_secs;
         Ok(Self {
             config: Arc::new(config),
@@ -2320,6 +2328,17 @@ pub struct ClientConfig {
     ///
     /// This defaults to `None`.
     pub no_proxy: Option<String>,
+
+    /// Fixed addresses for named hosts, in place of their DNS answers.
+    ///
+    /// Only the address changes: request URLs keep the host, so TLS sends it
+    /// as SNI and verifies the certificate against it. The port comes from
+    /// the URL. A client with any entry also refuses plain `http`, so a
+    /// redirect can never downgrade it. See
+    /// [`reqwest::ClientBuilder::resolve`].
+    ///
+    /// This defaults to no entries. (Codewire fork, codewire#4000.)
+    pub resolve: Vec<(String, std::net::IpAddr)>,
 }
 
 impl Default for ClientConfig {
@@ -2342,6 +2361,7 @@ impl Default for ClientConfig {
             https_proxy: None,
             http_proxy: None,
             no_proxy: None,
+            resolve: Vec::new(),
         }
     }
 }

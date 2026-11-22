@@ -166,6 +166,15 @@ impl CdhConfig {
         Ok(res)
     }
 
+    /// Whether the configuration file has an `[image]` table. With one, the
+    /// image configuration is that table alone (Codewire fork, codewire#4000).
+    pub fn file_has_image_table(config_path: &str) -> Result<bool> {
+        let c = Config::builder()
+            .add_source(File::with_name(config_path))
+            .build()?;
+        Ok(c.get_table("image").is_ok())
+    }
+
     /// all the resource ids can be from the kernel commandline in the following format:
     /// ```shell
     /// cdh.kbs_resources=<resource id 1>::<target path 1>,<resource id 2>::<target path 2>...
@@ -485,5 +494,59 @@ resource_provider_timeout_secs = 300
 
         let config = CdhConfig::from_file(file.path().to_str().unwrap()).unwrap();
         assert_eq!(config.aa_token_request_timeout_secs(), 300);
+    }
+
+    /// The measured `[image]` table carries the pull login and the registry
+    /// address together (codewire#4000), and the file says it has the table.
+    #[test]
+    fn image_table_carries_the_registry_address_and_login() {
+        let mut file = tempfile::Builder::new()
+            .append(true)
+            .suffix(".toml")
+            .tempfile()
+            .unwrap();
+        file.write_all(
+            br#"
+[kbc]
+name = "cc_kbc"
+url = "https://192.0.2.45:8080"
+
+[image]
+authenticated_registry_credentials_uri = "kbs:///default/containers/auth"
+
+[[image.registry_addresses]]
+host = "registry.example"
+address = "192.0.2.10"
+"#,
+        )
+        .unwrap();
+        let path = file.path().to_str().unwrap();
+        let config = CdhConfig::from_file(path).unwrap();
+        assert!(CdhConfig::file_has_image_table(path).unwrap());
+        assert_eq!(
+            config
+                .image
+                .authenticated_registry_credentials_uri
+                .as_deref(),
+            Some("kbs:///default/containers/auth")
+        );
+        assert_eq!(config.image.registry_addresses.len(), 1);
+        assert_eq!(config.image.registry_addresses[0].host, "registry.example");
+        assert_eq!(
+            config.image.registry_addresses[0].address,
+            "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_file_without_an_image_table_says_so() {
+        let mut file = tempfile::Builder::new()
+            .append(true)
+            .suffix(".toml")
+            .tempfile()
+            .unwrap();
+        file.write_all(b"[kbc]\nname = \"offline_fs_kbc\"\n")
+            .unwrap();
+        assert!(!CdhConfig::file_has_image_table(file.path().to_str().unwrap()).unwrap());
     }
 }

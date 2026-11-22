@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,6 +36,49 @@ pub const DEFAULT_RESOURCE_PROVIDER_TIMEOUT_SECS: u32 = 50;
 
 /// Path to the configuration file to generate ImageConfiguration
 pub const CONFIGURATION_FILE_NAME: &str = "config.json";
+
+/// One registry host and the address a pull reaches it at.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RegistryAddress {
+    /// The registry's host name, as an image reference names it, with no
+    /// port. Matched without regard to case.
+    pub host: String,
+    /// The address to connect to. The port stays the reference's.
+    pub address: IpAddr,
+}
+
+/// Refuses an empty host, a host that is itself an address or carries a port
+/// or path, and a host listed twice.
+pub fn validate_registry_addresses(addresses: &[RegistryAddress]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in addresses {
+        let host = entry.host.as_str();
+        if host.is_empty() || host.contains([':', '/', '@']) || host.parse::<IpAddr>().is_ok() {
+            return Err(anyhow!(
+                "registry address host {host:?} must be a host name without port or path"
+            ));
+        }
+        if !seen.insert(host.to_ascii_lowercase()) {
+            return Err(anyhow!("registry address host {host:?} is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+/// The address for a reference's registry (`host` or `host:port`), when one
+/// is listed for exactly that host.
+pub fn registry_address_for<'a>(
+    addresses: &'a [RegistryAddress],
+    registry: &str,
+) -> Option<&'a RegistryAddress> {
+    let host = match registry.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => registry,
+    };
+    addresses
+        .iter()
+        .find(|entry| entry.host.eq_ignore_ascii_case(host))
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct ProxyConfig {
@@ -173,6 +217,14 @@ pub struct ImageConfig {
     #[serde(default = "Vec::default")]
     pub extra_root_certificates: Vec<String>,
 
+    /// Registry hosts reached at a fixed address instead of a DNS answer
+    /// (Codewire fork, codewire#4000). A pull from exactly one of these hosts
+    /// connects to its address over HTTPS only, with the host still the TLS
+    /// name it verifies. Only this `[image]` configuration sets them: never
+    /// the kernel command line, the environment or a fetched resource.
+    #[serde(default = "Vec::default")]
+    pub registry_addresses: Vec<RegistryAddress>,
+
     #[cfg(feature = "keywrap-native")]
     #[serde(default = "default_kbc")]
     pub kbc: String,
@@ -226,6 +278,7 @@ impl Default for ImageConfig {
             registry_config: None,
             image_pull_proxy: None,
             extra_root_certificates: Vec::new(),
+            registry_addresses: Vec::new(),
 
             #[cfg(feature = "keywrap-native")]
             kbc: default_kbc(),
@@ -308,6 +361,7 @@ impl ImageConfig {
             registry_config: None,
             image_pull_proxy: None,
             extra_root_certificates: Vec::new(),
+            registry_addresses: Vec::new(),
 
             #[cfg(feature = "keywrap-native")]
             kbc: default_kbc(),
@@ -574,5 +628,80 @@ mod tests {
             .unwrap();
 
         assert!(ImageConfig::try_from(config_file.as_path()).is_err());
+    }
+
+    fn entry(host: &str, address: &str) -> RegistryAddress {
+        RegistryAddress {
+            host: host.to_string(),
+            address: address.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn registry_addresses_come_from_the_image_table() {
+        let config: ImageConfig = serde_json::from_str(
+            r#"{"registry_addresses": [{"host": "registry.example", "address": "192.0.2.10"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.registry_addresses,
+            vec![entry("registry.example", "192.0.2.10")]
+        );
+        validate_registry_addresses(&config.registry_addresses).unwrap();
+    }
+
+    #[test]
+    fn a_registry_address_that_is_not_an_ip_is_refused() {
+        let parsed = serde_json::from_str::<ImageConfig>(
+            r#"{"registry_addresses": [{"host": "registry.example", "address": "registry.other"}]}"#,
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[rstest]
+    #[case::empty(vec![entry("", "10.0.0.1")])]
+    #[case::ipv4_host(vec![entry("10.0.0.2", "10.0.0.1")])]
+    #[case::ipv6_host(vec![entry("fd00::2", "10.0.0.1")])]
+    #[case::port(vec![entry("registry.example:443", "10.0.0.1")])]
+    #[case::path(vec![entry("registry.example/codewire", "10.0.0.1")])]
+    #[case::twice(vec![entry("registry.example", "10.0.0.1"), entry("Registry.Example", "10.0.0.2")])]
+    fn bad_registry_addresses_are_refused(#[case] addresses: Vec<RegistryAddress>) {
+        assert!(validate_registry_addresses(&addresses).is_err());
+    }
+
+    #[test]
+    fn only_the_exact_host_is_overridden() {
+        let addresses = vec![entry("registry.example", "192.0.2.10")];
+        for registry in [
+            "registry.example",
+            "REGISTRY.example",
+            "registry.example:5000",
+        ] {
+            assert_eq!(
+                registry_address_for(&addresses, registry).map(|e| e.address),
+                Some("192.0.2.10".parse().unwrap()),
+                "{registry}"
+            );
+        }
+        for registry in [
+            "registry.example.evil",
+            "sub.registry.example",
+            "docker.io",
+            "registry.exampl",
+        ] {
+            assert_eq!(
+                registry_address_for(&addresses, registry),
+                None,
+                "{registry}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kernel_command_line_never_sets_registry_addresses() {
+        assert!(ImageConfig::from_kernel_cmdline()
+            .registry_addresses
+            .is_empty());
+        assert!(ImageConfig::default().registry_addresses.is_empty());
     }
 }

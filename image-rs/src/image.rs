@@ -372,6 +372,25 @@ impl ImageClient {
             });
         client_config.extra_root_certificates.extend(certs);
 
+        // A registry at a fixed address (codewire#4000): only its exact host,
+        // only over HTTPS, and only for this pull's client.
+        if let Some(entry) = crate::config::registry_address_for(
+            &self.config.registry_addresses,
+            task.image_reference.resolve_registry(),
+        ) {
+            if task.use_http {
+                return Err(PullImageError::Internal {
+                    source: anyhow::anyhow!(
+                        "registry {} has a fixed address, so it is pulled only over HTTPS",
+                        entry.host
+                    ),
+                });
+            }
+            client_config
+                .resolve
+                .push((entry.host.to_ascii_lowercase(), entry.address));
+        }
+
         let mut client = PullClient::new(
             task.image_reference,
             self.layer_store.clone(),

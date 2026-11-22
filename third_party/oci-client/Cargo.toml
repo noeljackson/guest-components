@@ -76,6 +76,10 @@ path = "examples/wasm/main.rs"
 name = "digest_validation"
 path = "tests/digest_validation.rs"
 
+[[test]]
+name = "resolve"
+path = "tests/resolve.rs"
+
 [dependencies.bytes]
 version = "1"
 
@@ -189,7 +193,15 @@ features = [
     "macros",
     "fs",
     "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
 ]
+
+[dev-dependencies.tokio-rustls]
+version = "0.26"
+default-features = false
+features = ["aws_lc_rs"]
 
 [dev-dependencies.tokio-util]
 version = "0.7"
