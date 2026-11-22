@@ -357,7 +357,9 @@ impl TryFrom<ClientConfig> for Client {
         }
 
         if !config.resolve.is_empty() {
-            client_builder = client_builder.https_only(true);
+            // No proxy of any kind, the environment's included: a proxy
+            // resolves the host itself, and the fixed address would go unused.
+            client_builder = client_builder.no_proxy().https_only(true);
             for (host, address) in &config.resolve {
                 client_builder =
                     client_builder.resolve(host, std::net::SocketAddr::new(*address, 0));
@@ -2334,7 +2336,8 @@ pub struct ClientConfig {
     /// Only the address changes: request URLs keep the host, so TLS sends it
     /// as SNI and verifies the certificate against it. The port comes from
     /// the URL. A client with any entry also refuses plain `http`, so a
-    /// redirect can never downgrade it. See
+    /// redirect can never downgrade it, and uses no proxy, configured or from
+    /// the environment. See
     /// [`reqwest::ClientBuilder::resolve`].
     ///
     /// This defaults to no entries. (Codewire fork, codewire#4000.)

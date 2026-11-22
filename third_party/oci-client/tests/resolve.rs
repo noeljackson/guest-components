@@ -164,16 +164,21 @@ async fn a_certificate_for_another_name_at_the_address_is_refused() {
 
 #[tokio::test]
 async fn an_unnamed_host_is_not_overridden() {
-    let (port, _) = serve("registry.test", ok_manifest()).await;
+    let (port, seen) = serve("registry.test", ok_manifest()).await;
     let client = client(vec![("other.test".to_string(), LOCALHOST)]);
-    // registry.test isn't in the list, so it needs DNS, which has no answer.
+    // registry.test isn't in the list, so it needs DNS, which has no answer;
+    // a slow resolver may leave the call unfinished, which is also a miss.
     let result = fetch(
         &client,
         &reference("registry.test", port),
         &RegistryAuth::Anonymous,
     )
     .await;
-    assert!(matches!(result, Some(Err(_))), "{result:?}");
+    assert!(!matches!(result, Some(Ok(_))), "{result:?}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the unnamed host reached the fixed address"
+    );
 }
 
 #[tokio::test]
@@ -251,4 +256,25 @@ async fn authorization_is_not_carried_to_another_host() {
             .all(|head| !head.to_ascii_lowercase().contains("authorization:")),
         "Authorization reached another host: {to_other:?}"
     );
+}
+
+#[tokio::test]
+async fn a_proxy_from_the_environment_is_not_used() {
+    // A proxy nothing listens on: a client that used it would fail.
+    let dead = TcpListener::bind((LOCALHOST, 0)).await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let (port, _) = serve("registry.test", ok_manifest()).await;
+    std::env::set_var("HTTPS_PROXY", format!("http://127.0.0.1:{dead_port}"));
+    let client = client(vec![("registry.test".to_string(), LOCALHOST)]);
+    std::env::remove_var("HTTPS_PROXY");
+    let digest = fetch(
+        &client,
+        &reference("registry.test", port),
+        &RegistryAuth::Anonymous,
+    )
+    .await
+    .expect("bounded")
+    .unwrap();
+    assert_eq!(digest, DIGEST);
 }
