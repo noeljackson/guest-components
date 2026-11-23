@@ -15,6 +15,8 @@ members = [
     "ocicrypt-rs",
     "protos",
 ]
+# Vendored crates patched below are their own packages, not members.
+exclude = ["third_party/oci-client"]
 
 [workspace.dependencies]
 aes = "0.9.1"
@@ -81,3 +83,10 @@ ttrpc-codegen = "0.6.0"
 url = "2.5.4"
 uuid = "1"
 zeroize = "1.8.2"
+
+# oci-client 0.17.0 from crates.io (checksum 5261a7fb43d9c53b8e63e6d5e86860719dad253d015d022066c72d585125aed8)
+# with one addition, ClientConfig::resolve, so a pull can reach a named
+# registry at a fixed address with no DNS (codewire#4000). `diff -r` against
+# the published crate shows only that field, its use and its tests.
+[patch.crates-io]
+oci-client = { path = "third_party/oci-client" }
